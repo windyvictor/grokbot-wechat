@@ -34,16 +34,23 @@ class Decision:
 
 
 def ilink_error_code(obj):
-    """First non-zero ret/errcode, or 0. Accepts numeric strings."""
+    """0 when both fields are absent or zero. -14 if either field is -14.
+
+    Any other first non-zero value is returned as-is. Numeric strings count.
+    """
     if not isinstance(obj, dict):
         return 0
+    codes = []
     for key in ("ret", "errcode"):
         if key not in obj or obj[key] in (None, ""):
             continue
         try:
-            n = int(obj[key])
+            codes.append(int(obj[key]))
         except (TypeError, ValueError):
             continue
+    if -14 in codes:
+        return -14
+    for n in codes:
         if n != 0:
             return n
     return 0
@@ -83,9 +90,28 @@ class RestartPolicy:
         delay = backoff_seconds(self.attempt, self.base, self.cap)
         alert = None
         if self.attempt >= self.alert_after and not self.alerted:
-            self.alerted = True
             alert = "receiver_hung" if kind == "hang" else "receiver_unstable"
         return Decision("restart", delay, alert)
+
+    def note_alerted(self):
+        """Call only after the alert POST succeeded. A failed POST must be retried."""
+        self.alerted = True
+
+
+def hang_verdict(hb, now, hang_s, child_pid, spawned_at):
+    """Hang only on this child's own heartbeat.
+
+    A file left by the previous pid is not evidence that the new process is stuck.
+    The child has hang_s to write its own stamp. auth_expired on its own stamp is
+    never a hang.
+    """
+    hb = hb or {}
+    own = child_pid is not None and hb.get("pid") == child_pid
+    if not own:
+        if now - spawned_at > hang_s:
+            return "hang"
+        return "starting"
+    return assess_heartbeat(hb, now, hang_s, True)
 
 
 def assess_heartbeat(hb, now, hang_s, pid_alive):
@@ -164,42 +190,64 @@ def adopt_or_lock(path):
     return acquire_receiver_lock(path)
 
 
-def lock_holder_pids(path):
-    """PIDs holding an flock on path, from /proc/locks. Best-effort."""
+def receiver_pid_matches(pid, code_dir):
+    """True only for this checkout's forward.py / supervisor. Never a foreign inode."""
     try:
-        inode = str(os.stat(path).st_ino)
-        lines = open("/proc/locks", encoding="utf-8").read().splitlines()
+        cmd = open("/proc/%d/cmdline" % pid, "rb").read().replace(b"\0", b" ").decode("utf-8", "replace")
+        cwd = os.path.realpath(os.readlink("/proc/%d/cwd" % pid))
     except OSError:
-        return []
+        return False
+    if cwd != os.path.realpath(code_dir):
+        return False
+    return "forward.py" in cmd or "receive_supervisor.py" in cmd
+
+
+def _recorded_pids(hb, lock_path):
     pids = []
-    for line in lines:
-        parts = line.split()
-        # e.g. "1: FLOCK ADVISORY WRITE 123 00:12:345 0 EOF"
-        if len(parts) < 6 or parts[1] != "FLOCK":
-            continue
-        ino = parts[5].split(":")[-1]
-        if ino != inode:
-            continue
+    if hb and hb.get("pid") is not None:
         try:
-            pids.append(int(parts[4]))
-        except ValueError:
-            continue
+            pids.append(int(hb["pid"]))
+        except (TypeError, ValueError):
+            pass
+    try:
+        text = open(os.path.join(os.path.dirname(lock_path), "supervisor.pid"), encoding="utf-8").read()
+        pids.append(int(text.strip()))
+    except (OSError, ValueError):
+        pass
     return pids
 
 
-def prepare_lock(path, read_heartbeat_fn, now, hang_s, kill, sleep, holders=None):
-    """Take the singleton lock. A hung holder's poll is stopped once; a live one is refused."""
+def prepare_lock(path, read_heartbeat_fn, now, hang_s, kill, sleep, candidate_pids=None, is_ours=None, code_dir=None):
+    """Take the singleton lock.
+
+    A live or auth_expired holder is refused. A stale heartbeat may be replaced
+    by stopping only pids this receiver recorded, after a cmdline and cwd check.
+    """
     lock = acquire_receiver_lock(path)
     if lock is not None:
         return lock
-    verdict = assess_heartbeat(read_heartbeat_fn(), now, hang_s, True)
-    if verdict != "hang":
+    hb = read_heartbeat_fn()
+    if assess_heartbeat(hb, now, hang_s, True) != "hang":
         return None
-    for pid in (holders or lock_holder_pids)(path):
-        if pid != os.getpid():
+    pids = list(candidate_pids()) if candidate_pids else _recorded_pids(hb, path)
+    mine = os.getpid()
+
+    def ours(pid):
+        if is_ours is not None:
+            return bool(is_ours(pid))
+        if not code_dir:
+            return False
+        return receiver_pid_matches(pid, code_dir)
+
+    for pid in pids:
+        if pid and pid != mine and ours(pid):
             kill(pid)
-    sleep(0.2)
-    return acquire_receiver_lock(path)
+    for _ in range(25):
+        sleep(0.2)
+        lock = acquire_receiver_lock(path)
+        if lock is not None:
+            return lock
+    return None
 
 
 class AlertDeduper:
@@ -253,8 +301,21 @@ class AlertDeduper:
     def recover(self, text):
         if not self.state.get("open"):
             return False
-        self.poster(self._body("recovered", text))
+        now = self.clock()
+        if (self.state.get("last_failed_kind") == "recovered" and self.min_interval
+                and now - (self.state.get("last_failed_at") or 0) < self.min_interval):
+            return False
+        try:
+            self.poster(self._body("recovered", text))
+        except Exception as e:
+            self.state["last_failed_kind"] = "recovered"
+            self.state["last_failed_at"] = now
+            self._save()
+            log.warning("recovery alert not delivered: %s", type(e).__name__)
+            return False
         self.state["open"] = None
+        self.state["last_failed_kind"] = None
+        self.state["last_failed_at"] = None
         self._save()
         return True
 
@@ -302,7 +363,7 @@ def should_hold(payload, rules, backlog_before_ms=None):
         ms = int(payload.get("create_time_ms") or 0)
     except (TypeError, ValueError):
         ms = 0
-    if backlog_before_ms is not None and ms and ms < int(backlog_before_ms):
+    if backlog_before_ms is not None and (not ms or ms < int(backlog_before_ms)):
         return {"reason": "backlog"}
     return match_quarantine(payload, rules)
 
@@ -358,6 +419,26 @@ class QuarantineStore:
         return None
 
 
+def sweep_preexisting_pending(pending_path, store):
+    """Move every message already in pending.json into the quarantine audit.
+
+    Used only for the recovery start. The pending file is replaced with an empty
+    document after the holds are on disk, so the flusher cannot post them.
+    """
+    try:
+        with open(pending_path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except Exception:
+        return []
+    msgs = [m for m in (doc.get("messages") or []) if isinstance(m, dict)]
+    if not msgs:
+        return []
+    for payload in msgs:
+        store.hold(payload, {"reason": "preexisting-pending"})
+    atomic_json(pending_path, {"messages": [], "oldest": None, "last": None})
+    return msgs
+
+
 def route_payload(payload, rules, store, pending_add, backlog_before_ms=None):
     rule = should_hold(payload, rules, backlog_before_ms)
     if rule:
@@ -376,11 +457,20 @@ def commit_poll(outcome, persist, save_state):
         save_state(outcome["state"])
 
 
-def hold_auth(sleep, beat, interval=30, cycles=None):
-    """Stay up without calling getupdates. A restart loop must not see us exit."""
+def hold_auth(sleep, beat, interval=30, cycles=None, retry_alert=None):
+    """Stay up without calling getupdates. A restart loop must not see us exit.
+
+    retry_alert is safe to call every interval: AlertDeduper suppresses repeats
+    and retries a failed POST only after its own gap.
+    """
     n = 0
     while cycles is None or n < cycles:
         beat("auth_expired")
+        if retry_alert:
+            try:
+                retry_alert()
+            except Exception:
+                log.warning("auth alert retry failed")
         sleep(interval)
         n += 1
 
@@ -401,16 +491,23 @@ def serve(spawn, policy, alerter, read_heartbeat_fn, clock, sleep, hang_s=HANG_S
     while True:
         if stop_when and stop_when():
             return 0
+        spawned_at = clock()
         proc = spawn(lock)
+        child_pid = getattr(proc, "pid", None)
         hung = False
         while proc.poll() is None:
             if stop_when and stop_when():
                 proc.kill()
                 return 0
-            verdict = assess_heartbeat(read_heartbeat_fn(), clock(), hang_s, True)
+            verdict = hang_verdict(read_heartbeat_fn(), clock(), hang_s, child_pid, spawned_at)
             if verdict == "hang":
                 proc.kill()
                 hung = True
+                if proc.poll() is None and hasattr(proc, "wait"):
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
                 if proc.poll() is None:
                     proc.returncode = -9
                 break
@@ -429,8 +526,8 @@ def serve(spawn, policy, alerter, read_heartbeat_fn, clock, sleep, hang_s=HANG_S
             return AUTH_EXIT
         cycles += 1
         decision = policy.decide("hang" if hung else "crash", clock())
-        if decision.alert:
-            alerter.fail(decision.alert, ALERT_TEXT.get(decision.alert, decision.alert))
+        if decision.alert and alerter.fail(decision.alert, ALERT_TEXT.get(decision.alert, decision.alert)):
+            policy.note_alerted()
         if decision.action == "stop":
             return 1
         sleep(decision.backoff)
@@ -553,11 +650,12 @@ def run_serve():
 
     def kill(pid):
         try:
-            os.kill(pid, signal.SIGTERM)
+            os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
 
-    lock = prepare_lock(lock_path, lambda: read_heartbeat(hb_path), time.time(), HANG_S, kill, time.sleep)
+    lock = prepare_lock(lock_path, lambda: read_heartbeat(hb_path), time.time(), HANG_S, kill, time.sleep,
+                        code_dir=code)
     if lock is None:
         log.error("another receiver holds the lock and its heartbeat is not a hang; not starting")
         return LOCK_EXIT
@@ -596,21 +694,23 @@ def quarantine_release(message_id):
     if probe is None:
         print("receiver is running; stop it before release so its pending buffer cannot overwrite the file")
         return 1
-    probe.close()
-    store = QuarantineStore(path)
-    payload = store.release(message_id)
-    if payload is None:
-        try:
-            payload = store.release(int(message_id))
-        except ValueError:
-            payload = None
-    if payload is None:
-        print("no held message_id %s" % message_id)
-        return 1
-    import forward
-    forward.Batcher(os.path.join(data, "pending.json")).add(payload)
-    print("released message_id=%s into pending.json; audit row kept. start the receiver to flush it" % payload.get("message_id"))
-    return 0
+    try:
+        store = QuarantineStore(path)
+        payload = store.release(message_id)
+        if payload is None:
+            try:
+                payload = store.release(int(message_id))
+            except ValueError:
+                payload = None
+        if payload is None:
+            print("no held message_id %s" % message_id)
+            return 1
+        import forward
+        forward.Batcher(os.path.join(data, "pending.json")).add(payload)
+        print("released message_id=%s into pending.json; audit row kept. start the receiver to flush it" % payload.get("message_id"))
+        return 0
+    finally:
+        probe.close()
 
 
 def main(argv=None):

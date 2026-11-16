@@ -182,7 +182,7 @@ cp .env.example .env            # 先空着 webhook，下一步再填
 14. **绑定**：二维码会过期（自动刷新，最多 `MAX_REFRESH` 次）；可能返回 `scaned_but_redirect`，要改用 `redirect_host`；可能要求输入手机上显示的数字（`need_verifycode`）。
 15. **Webhook 重试**：4xx（除 408/429）是配置错（URL / key 不对），重试没用，直接放弃并保留 pending，修好配置后重启即可补发。
 16. **getupdates 返回 -14**：登录态失效。继续轮询没有用，还会打成重试风暴。接收器停止拉消息、通过现有 webhook 告警一次；`send.py` 不受影响。重新 `bind.py` 之后再启动。
-17. **长时间停收后的积压**：游标还停在停机前。直接启动会把积压消息整批 POST，已经在别处处理过的任务会被再执行一次。第一次恢复用 `WECHAT_QUARANTINE_BACKLOG=1`，先审 `quarantine.json`，再释放应该投递的消息。规则文件不要提交。
+17. **长时间停收后的积压**：游标还停在停机前，`pending.json` 里也可能还有没发出去的消息。第一次恢复用 `WECHAT_QUARANTINE_BACKLOG=1`：已有 pending 和新拉到的旧消息都进 `quarantine.json`，不自动 POST。先审再释放应该投递的消息。规则文件不要提交。
 
 ---
 

@@ -18,9 +18,9 @@
 
 ## 这次改了什么
 
-- `supervise.sh` / `receive_supervisor.py`：同一时刻只有一个接收进程持有 `receiver.lock`。崩溃或轮询卡住按 2、4、8、16、32、60 秒退避重启。心跳是 JSON，长轮询开始时状态为 `in_poll`，返回后才更新；超过 150 秒仍是 `in_poll` 就杀掉子进程并重启。
+- `supervise.sh` / `receive_supervisor.py`：同一时刻只有一个接收进程持有 `receiver.lock`。崩溃或轮询卡住按 2、4、8、16、32、60 秒退避重启。心跳是 JSON，并且带本进程 pid。上一轮留下的旧心跳不会用来杀掉刚拉起的子进程；子进程有 150 秒写出自己的心跳。它自己的 `in_poll` 超过 150 秒才算卡住。`auth_expired` 不会被当成卡住。接管时只向本目录里记录下来的 `forward.py` / `receive_supervisor.py` 发信号。
 - `forward.py`：`-14` 写 `auth_expired`，通过现有 webhook 告警一次，然后停在原地不再调用 getupdates。`send.py` 不看这个状态。暂时网络错误指数退避，连续 5 次才告警一次，恢复后再告警一次。消息先写入 pending 或 quarantine 和 seen，然后才写游标。`message_id` 已在 pending 里则不再追加。
-- 积压隔离：`WECHAT_QUARANTINE_BACKLOG=1` 时，启动时刻之前的消息进入 `quarantine.json`（保留全文，状态 `held`），不 POST。其余规则见 `quarantine-rules.example.json`。释放只改状态并拷进 pending，不删审计记录。
+- 积压隔离：`WECHAT_QUARANTINE_BACKLOG=1` 时，做两件事，都不会 POST。一是把已经在 `pending.json` 里的消息整份挪进 `quarantine.json`（原因 `preexisting-pending`）。二是本轮新拉到的、时间早于进程启动或没有时间戳的消息也进入隔离区。全文保留。释放只改状态并拷进 pending，而且在写入 pending 完成前一直持有接收锁。
 - `watchdog.sh`：监管进程还在，或心跳已是 `auth_expired` 时，不再拉起第二个轮询。
 - `install_autostart.py`：只有 PID1 是 systemd 且 `systemctl is-system-running` 成功才安装 user unit，并回读 `is-enabled`；只有 `cron`/`crond` 真的在跑才写 crontab。否则退出码 2，不写任何单元。
 
@@ -63,21 +63,21 @@ git diff -- run_forward.sh
 
 `run_forward.sh` 在生产上有本地修改，`start_forward.sh` 未跟踪。不要 `git checkout --` 它们，也不要用仓库副本直接覆盖。
 
-建议的拿代码方式：只把下面这些路径从本 PR 更新进生产目录，保留生产上的 `.env`、`credentials.json` 和全部运行时文件。
+建议的拿代码方式：只把运行所需的这些文件从本 PR 拷进生产目录。不要覆盖生产上已修改的 `run_forward.sh`，不要动未跟踪的 `start_forward.sh`，不要替换 `.env`、`credentials.json` 或任何日志、游标、pending、outbox。
+
+只要这些代码文件：
 
 - `receive_supervisor.py`
 - `forward.py`
+- `ilink.py`
+- `outbox.py`
 - `supervise.sh`
 - `watchdog.sh`
 - `install_autostart.py`
-- `quarantine-rules.example.json`
-- `deploy/RECEIVE_RECOVERY.md`
-- `deploy/preflight.sh`
-- `routines/inbound-webhook.md`
-- `routines/watchdog.md`
-- `tests/test_receive_reliability.py`
-- `.gitignore`
-- `README.md`
+
+`nohup` 仍然不是自启动。tini 上 `install_autostart.py --install` 退出码 2，不安装任何单元。容器入口要前台执行 `./supervise.sh`。
+
+说明和测试可以另拷，但不是运行所必需：`deploy/RECEIVE_RECOVERY.md`、`deploy/preflight.sh`、`deploy/receive-reliability.patch`、`quarantine-rules.example.json`、`routines/`、`tests/test_receive_reliability.py`、`README.md`、`.gitignore`、`.env.example`（只读新增的变量说明，不要覆盖生产 `.env`）。
 
 `.env.example` 只增加了说明。不要用它覆盖生产 `.env`。
 

@@ -33,6 +33,7 @@ class BackoffAndClassifyTest(unittest.TestCase):
         self.assertEqual(guard.classify_poll({"errcode": "-14"}), "auth")
         self.assertEqual(guard.classify_poll({"ret": 0, "msgs": []}), "ok")
         self.assertEqual(guard.classify_poll({"ret": -1, "errcode": -1}), "transient")
+        self.assertEqual(guard.classify_poll({"ret": -1, "errcode": "-14"}), "auth")
         self.assertEqual(guard.classify_poll(exc=TimeoutError("long poll")), "timeout")
         self.assertEqual(guard.classify_poll(exc=OSError("network down")), "transient")
 
@@ -51,7 +52,9 @@ class RestartAndLockTest(unittest.TestCase):
         self.assertEqual(third.alert, "receiver_hung")
         again = policy.decide("crash", now=1020)
         self.assertLessEqual(again.backoff, 60)
-        self.assertIsNone(again.alert)
+        self.assertEqual(again.alert, "receiver_unstable")
+        policy.note_alerted()
+        self.assertIsNone(policy.decide("crash", now=1030).alert)
         auth = guard.RestartPolicy().decide("auth", now=1000)
         self.assertEqual((auth.action, auth.backoff, auth.alert), ("stop", 0, "auth_expired"))
 
@@ -111,7 +114,8 @@ class RestartAndLockTest(unittest.TestCase):
         killed = {"n": 0}
 
         class Hung:
-            def __init__(self):
+            def __init__(self, pid):
+                self.pid = pid
                 self.returncode = None
             def poll(self):
                 return self.returncode
@@ -119,14 +123,29 @@ class RestartAndLockTest(unittest.TestCase):
                 killed["n"] += 1
                 self.returncode = -9
 
+        clock = {"t": 5000}
         sleeps = []
-        rc = guard.serve(lambda _l: Hung(), guard.RestartPolicy(alert_after=1),
+
+        def sleep_past_grace(seconds):
+            sleeps.append(seconds)
+            clock["t"] += 200
+
+        # Previous process left a stale stamp. The new child is not killed until its own grace expires.
+        rc = guard.serve(lambda _l: Hung(50), guard.RestartPolicy(alert_after=1),
                          guard.AlertDeduper(os.path.join(self._dir(), "h.json"), lambda p: None),
-                         lambda: {"status": "in_poll", "updated_at": 0}, lambda: 1000,
-                         sleeps.append, hang_s=150, max_cycles=1)
+                         lambda: {"status": "in_poll", "updated_at": 0, "pid": 1}, lambda: clock["t"],
+                         sleep_past_grace, hang_s=150, max_cycles=1)
         self.assertEqual(rc, 0)
         self.assertEqual(killed["n"], 1)
-        self.assertEqual(sleeps, [2])
+        self.assertEqual(sleeps[0], 5)
+        self.assertEqual(sleeps[-1], 2)
+
+        killed["n"] = 0
+        own = {"status": "in_poll", "updated_at": 0, "pid": 7}
+        rc = guard.serve(lambda _l: Hung(7), guard.RestartPolicy(alert_after=9),
+                         guard.AlertDeduper(os.path.join(self._dir(), "h2.json"), lambda p: None),
+                         lambda: own, lambda: 1000, sleeps.append, hang_s=150, max_cycles=1)
+        self.assertEqual(killed["n"], 1)
 
     def test_live_auth_hold_is_not_killed_or_respawned(self):
         spawned = {"n": 0}
@@ -195,6 +214,29 @@ class AlertAndAuthTest(unittest.TestCase):
         self.assertEqual(posted[1]["kind"], "recovered")
         self.assertTrue(alerter.fail("auth_expired", guard.AUTH_TEXT))
         self.assertEqual(len(posted), 3)
+
+    def test_failed_alert_is_retried_after_interval_not_latched(self):
+        path = os.path.join(tempfile.mkdtemp(prefix="alert-fail-"), "alert_state.json")
+        clock = {"t": 1000.0}
+        calls = {"n": 0}
+        posted = []
+
+        def poster(body):
+            calls["n"] += 1
+            if calls["n"] == 1 or body["kind"] == "recovered":
+                raise RuntimeError("webhook down")
+            posted.append(body)
+
+        alerter = guard.AlertDeduper(path, poster, clock=lambda: clock["t"], min_interval=900)
+        self.assertFalse(alerter.fail("auth_expired", guard.AUTH_TEXT))
+        self.assertIsNone(alerter.state.get("open"))
+        self.assertFalse(alerter.fail("auth_expired", guard.AUTH_TEXT))
+        self.assertEqual(calls["n"], 1)
+        clock["t"] = 2000
+        self.assertTrue(alerter.fail("auth_expired", guard.AUTH_TEXT))
+        self.assertEqual(alerter.state.get("open"), "auth_expired")
+        self.assertFalse(alerter.recover(guard.RECOVER_TEXT))
+        self.assertEqual(alerter.state.get("open"), "auth_expired")
 
     def test_auth_step_stops_without_sleep_and_second_alert_is_suppressed(self):
         tmp = tempfile.mkdtemp(prefix="auth-step-")
@@ -306,6 +348,96 @@ class PendingAndQuarantineTest(unittest.TestCase):
         self.assertEqual(guard.route_payload(live, [], store, pending.append, backlog_before_ms=1000), "pending")
         self.assertEqual(store.items()[0]["reason"], "backlog")
         self.assertEqual([p["message_id"] for p in pending], [2])
+        missing = {"message_id": 3, "texts": ["no timestamp"]}
+        self.assertEqual(guard.route_payload(missing, [], store, pending.append, backlog_before_ms=1000), "held")
+        self.assertEqual([p["message_id"] for p in pending], [2])
+
+    def test_preexisting_pending_is_quarantined_before_flush(self):
+        tmp = tempfile.mkdtemp(prefix="old-pending-")
+        pending_path = os.path.join(tmp, "pending.json")
+        json.dump({"messages": [{"message_id": 3, "texts": ["already buffered"], "create_time_ms": 10}]},
+                  open(pending_path, "w"))
+        store = guard.QuarantineStore(os.path.join(tmp, "q.json"))
+        moved = guard.sweep_preexisting_pending(pending_path, store)
+        self.assertEqual([m["message_id"] for m in moved], [3])
+        self.assertEqual(json.load(open(pending_path))["messages"], [])
+        item = store.items()[0]
+        self.assertEqual(item["status"], "held")
+        self.assertEqual(item["reason"], "preexisting-pending")
+        self.assertEqual(item["payload"]["texts"], ["already buffered"])
+        sent = []
+        t = {"n": 1000.0}
+        batcher = forward.Batcher(pending_path, quiet=3, cap=60,
+                                   poster=lambda body: sent.append(body) or (200, "ok"),
+                                   clock=lambda: t["n"], history_path=os.path.join(tmp, "h.log"))
+        t["n"] += 10
+        self.assertFalse(batcher.maybe_flush())
+        self.assertEqual(sent, [])
+
+    def test_seen_is_durable_before_the_next_message(self):
+        tmp = tempfile.mkdtemp(prefix="seen-order-")
+        seen_path = os.path.join(tmp, "seen.json")
+        pending_path = os.path.join(tmp, "pending.json")
+        t = {"n": 1.0}
+        batcher = forward.Batcher(pending_path, quiet=3, cap=60, poster=lambda body: (200, "ok"),
+                                   clock=lambda: t["n"], history_path=os.path.join(tmp, "h.log"))
+        store = guard.QuarantineStore(os.path.join(tmp, "q.json"))
+        orig = forward.build_payload
+        seen_at_second = {}
+
+        def build(m, attach_dir=None, fetch=True):
+            if m.get("message_id") == 2:
+                seen_at_second["ids"] = json.load(open(seen_path))
+            return {"message_id": m.get("message_id"), "texts": ["x"], "item_types": [1], "items": []}
+
+        forward.build_payload = build
+        try:
+            forward.handle([msg(1, "a", 1), msg(2, "b", 2)], batcher, store, seen_path, rules=[])
+        finally:
+            forward.build_payload = orig
+        self.assertEqual(seen_at_second["ids"], [1])
+        self.assertEqual(json.load(open(seen_path)), [1, 2])
+
+    def test_cursor_merge_keeps_fields_written_meanwhile(self):
+        path = os.path.join(tempfile.mkdtemp(prefix="state-merge-"), "state.json")
+        orig = ilink.STATE
+        ilink.STATE = path
+        try:
+            ilink.save_state({"get_updates_buf": "old", "nudged_for": 5, "last_inbound_ms": 1})
+            forward.save_polled_state({"get_updates_buf": "new", "last_inbound_ms": 9,
+                                       "context_tokens": {"u": "t"}, "raw_log": []})
+            saved = json.load(open(path))
+        finally:
+            ilink.STATE = orig
+        self.assertEqual(saved["get_updates_buf"], "new")
+        self.assertEqual(saved["nudged_for"], 5)
+        self.assertEqual(saved["last_inbound_ms"], 9)
+        self.assertEqual(saved["context_tokens"]["u"], "t")
+
+    def test_prepare_lock_kills_only_our_hung_pid(self):
+        path = os.path.join(tempfile.mkdtemp(prefix="takeover-"), "receiver.lock")
+        held = guard.acquire_receiver_lock(path)
+        killed = []
+        box = {"held": held}
+
+        def sleep(_s):
+            if killed and box["held"] is not None:
+                box["held"].close()
+                box["held"] = None
+
+        refused = guard.prepare_lock(
+            path, lambda: {"status": "auth_expired", "updated_at": 1, "pid": 9},
+            99999, 150, killed.append, lambda _s: None,
+            candidate_pids=lambda: [9], is_ours=lambda pid: True)
+        self.assertIsNone(refused)
+        self.assertEqual(killed, [])
+        got = guard.prepare_lock(
+            path, lambda: {"status": "in_poll", "updated_at": 0, "pid": 9},
+            1000, 150, killed.append, sleep,
+            candidate_pids=lambda: [8, 9], is_ours=lambda pid: pid == 9)
+        self.assertIsNotNone(got)
+        self.assertEqual(killed, [9])
+        got.close()
 
     def test_cursor_is_saved_only_after_pending_is_durable(self):
         tmp = tempfile.mkdtemp(prefix="cur-")

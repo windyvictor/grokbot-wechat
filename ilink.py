@@ -1,7 +1,7 @@
 """Minimal WeChat ClawBot iLink client.
 Protocol notes: https://chihao.li/blog/en/wechat-clawbot-ilink-protocol and the
 @tencent-weixin/openclaw-weixin 2.4.9 npm package (headers / base_info mimic that client)."""
-import base64, json, os, random, secrets, urllib.request
+import base64, fcntl, json, os, random, secrets, threading, urllib.request
 from config import DATA_DIR
 DIR = DATA_DIR
 CRED = os.path.join(DIR, "credentials.json")   # written by bind.py; NEVER commit
@@ -14,10 +14,29 @@ def creds():
 def load_state():
     return json.load(open(STATE)) if os.path.exists(STATE) else {}
 
+_STATE_THREAD = threading.Lock()
+
 def save_state(s):
     tmp = STATE + ".tmp"
-    with open(tmp, "w") as f: json.dump(s, f, indent=2, ensure_ascii=False)
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
     os.chmod(tmp, 0o600); os.replace(tmp, STATE)
+
+def mutate_state(mutator):
+    """Reload state.json, apply mutator, and save, serialized across threads and processes."""
+    lock_path = STATE + ".lock"
+    with _STATE_THREAD:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            st = load_state()
+            mutator(st)
+            save_state(st)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
 def post(endpoint, body, timeout=15):
     c = creds()

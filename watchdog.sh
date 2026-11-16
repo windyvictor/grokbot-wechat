@@ -5,7 +5,13 @@
 # auth_expired): that would poll getupdates again.
 # It does nothing useful unless something executes it. nohup is not a substitute.
 cd "$(dirname "$(readlink -f "$0")")" || exit 2
-DATA="${BRIDGE_DATA_DIR:-.}"
+# config.py reads .env. Do not print it. A data dir set only there must still
+# be the directory whose heartbeat says auth_expired.
+if [ -n "${BRIDGE_DATA_DIR:-}" ]; then
+  DATA="$BRIDGE_DATA_DIR"
+else
+  DATA="$(python3 -c 'import config; print(config.DATA_DIR)')"
+fi
 here="$(pwd -P)"
 
 supervisor_alive() {

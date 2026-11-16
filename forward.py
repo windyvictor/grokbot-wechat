@@ -149,6 +149,8 @@ class Batcher:
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"messages": self.msgs, "oldest": self.oldest, "last": self.last}, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, self.path)
 
     def add(self, payload):
@@ -218,15 +220,16 @@ class Batcher:
             except Exception as e: log.warning("flusher error: %s: %s", type(e).__name__, e)
             time.sleep(interval)
 
-def handle(msgs, batcher, quarantine=None, seen_path=None, rules=None, backlog_before_ms=None):
+def handle(msgs, batcher, quarantine=None, seen_path=None, rules=None, backlog_before_ms=None, heartbeat_path=None):
     seen_path = seen_path or SEEN
     rules = [] if rules is None else rules
     seen = load_seen(seen_path)
-    changed = False
     for m in msgs:
         if m.get("message_type") != 1: continue
         mid = m.get("message_id")
         if mid is not None and mid in seen: continue
+        if heartbeat_path:
+            guard.write_heartbeat(heartbeat_path, "persisting")
         payload = build_payload(m)
         payload["prev_inbound_ms"] = m.get("_prev_inbound_ms")
         route = guard.route_payload(payload, rules, quarantine, batcher.add, backlog_before_ms)
@@ -234,9 +237,7 @@ def handle(msgs, batcher, quarantine=None, seen_path=None, rules=None, backlog_b
                  payload["item_types"], payload.get("files"))
         if mid is not None:
             seen = (seen + [mid])[-500:]
-            changed = True
-    if changed:
-        guard.atomic_json(seen_path, seen)
+            guard.atomic_json(seen_path, seen)
 
 def step(batcher, quarantine, alerter, fails, fetch=None, sleep=None, save_state=None,
          seen_path=None, rules=None, backlog_before_ms=None, heartbeat_path=None):
@@ -247,7 +248,7 @@ def step(batcher, quarantine, alerter, fails, fetch=None, sleep=None, save_state
     """
     poll_fn = fetch if fetch is not None else sys.modules[__name__].fetch
     sleep = sleep or time.sleep
-    save_state_fn = save_state or ilink.save_state
+    save_state_fn = save_state or save_polled_state
     seen_path = seen_path or SEEN
     if rules is None:
         rules = guard.load_rules(os.path.join(DIR, "quarantine-rules.json"))
@@ -276,13 +277,15 @@ def step(batcher, quarantine, alerter, fails, fetch=None, sleep=None, save_state
                     outcome.get("error") or outcome.get("ret"))
         sleep(delay)
         return "backoff", fails
-    if fails:
+    try:
         alerter.recover(guard.RECOVER_TEXT)
+    except Exception as e:
+        log.warning("recovery alert failed: %s", type(e).__name__)
     fails = 0
     guard.write_heartbeat(hb, "polling", ret=0)
     if kind == "ok":
         def persist(msgs):
-            handle(msgs, batcher, quarantine, seen_path, rules, backlog_before_ms)
+            handle(msgs, batcher, quarantine, seen_path, rules, backlog_before_ms, heartbeat_path=hb)
         guard.commit_poll(outcome, persist, save_state_fn)
     return "ok", fails
 
@@ -301,6 +304,23 @@ def outbox_loop():
             log.warning("outbox loop error: %s: %s", type(e).__name__, e)
         time.sleep(15)
 
+def save_polled_state(snapshot):
+    """Write the polled cursor without dropping fields another thread saved meanwhile."""
+    def merge(current):
+        if snapshot.get("get_updates_buf"):
+            current["get_updates_buf"] = snapshot["get_updates_buf"]
+        if snapshot.get("last_from_user_id"):
+            current["last_from_user_id"] = snapshot["last_from_user_id"]
+        tokens = snapshot.get("context_tokens") or {}
+        if tokens:
+            current.setdefault("context_tokens", {}).update(tokens)
+        inbound = snapshot.get("last_inbound_ms")
+        if inbound:
+            current["last_inbound_ms"] = max(current.get("last_inbound_ms") or 0, inbound)
+        if "raw_log" in snapshot:
+            current["raw_log"] = snapshot["raw_log"]
+    ilink.mutate_state(merge)
+
 def _deliver_alert(payload):
     result = post_webhook(payload, tries=1)
     if not (isinstance(result, tuple) and 200 <= int(result[0]) < 300):
@@ -317,8 +337,12 @@ def main():
     backlog_before = int(time.time() * 1000) if backlog else None
     log.info("forwarder start pid=%d url_set=%s key_present=%s quiet=%ds cap=%ds backlog_before=%s",
              os.getpid(), bool(WEBHOOK_URL), bool(webhook_key()), QUIET_S, CAP_S, backlog_before)
-    batcher = Batcher()
     store = guard.QuarantineStore(os.path.join(DIR, "quarantine.json"))
+    if backlog:
+        moved = guard.sweep_preexisting_pending(PENDING, store)
+        if moved:
+            log.info("quarantined %d preexisting pending message(s)", len(moved))
+    batcher = Batcher()
     alerter = guard.AlertDeduper(os.path.join(DIR, "alert_state.json"), _deliver_alert)
     threading.Thread(target=batcher.run, daemon=True, name="flusher").start()
     threading.Thread(target=outbox_loop, daemon=True, name="outbox").start()
@@ -335,7 +359,8 @@ def main():
             continue
         if action == "stop_auth":
             log.error("getupdates auth expired (-14); polling stopped until re-bind. send.py is unaffected")
-            guard.hold_auth(time.sleep, lambda status: guard.write_heartbeat(HEARTBEAT, status, ret=-14))
+            guard.hold_auth(time.sleep, lambda status: guard.write_heartbeat(HEARTBEAT, status, ret=-14),
+                            retry_alert=lambda: alerter.fail("auth_expired", guard.AUTH_TEXT))
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
