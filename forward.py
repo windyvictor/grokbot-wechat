@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """Forward WeChat ClawBot user messages (message_type==1) to a Grok Bot webhook routine.
-Loops forever on ilink/bot/getupdates (same cursor/state handling as poll.py). Logs to forward.log.
+Loops on ilink/bot/getupdates (same cursor/state handling as poll.py). Logs to forward.log.
 Three threads:
   main     long-poll getupdates -> dedupe -> download media -> append to pending.json
   flusher  POST pending.json as one batch once the user pauses (BATCH_QUIET_S) or after BATCH_CAP_S
   outbox   flush queued sends right after the user writes; keep-alive nudge before the ~24h window closes
+Login expiry (ret/errcode -14) stops polling and alerts once; it does not retry and does not affect send.py.
+WECHAT_QUARANTINE_BACKLOG=1 or quarantine-rules.json holds matching messages for inspection instead of posting them.
+Prefer ./supervise.sh over running this file under a bare restart loop.
 Usage: python3 forward.py [--selftest]"""
-import json, os, socket, sys, threading, time, logging, urllib.request, urllib.error
-from ilink import post, load_state, save_state, DIR
+import json, os, sys, threading, time, logging, urllib.request, urllib.error
+import ilink
+import receive_supervisor as guard
+from ilink import DIR
 import config, media, history, outbox
 from config import WEBHOOK_URL, webhook_key, OWNER_NAME
 
 SEEN = os.path.join(DIR, "forward_seen.json")      # recent message_ids, for dedupe
-HEARTBEAT = os.path.join(DIR, "forward.heartbeat") # touched after every long-poll; watchdog.sh checks its age
+HEARTBEAT = os.path.join(DIR, "forward.heartbeat") # JSON progress stamp; stale in_poll means the long-poll is hung
 logging.basicConfig(filename=os.path.join(DIR, "forward.log"), level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("forward")
@@ -43,23 +48,38 @@ def post_webhook(payload, tries=5):
     log.error("webhook gave up after %d tries", tries)
     return None
 
-def load_seen():
-    try: return json.load(open(SEEN))
+def load_seen(path=None):
+    try: return json.load(open(path or SEEN))
     except Exception: return []
 
 def fetch():
-    """One long-poll. Returns (ok, msgs). Mirrors poll.once() state updates."""
-    st = load_state()
+    """One long-poll. Does not write state.json; the caller persists messages first.
+
+    Returns a dict: kind is ok, timeout, transient, or auth. Timeout is a normal
+    empty long-poll. auth means ret/errcode -14 (login expired): do not retry.
+    """
+    st = ilink.load_state()
     try:
-        raw = post("ilink/bot/getupdates", {"get_updates_buf": st.get("get_updates_buf", "")}, timeout=40)
-    except (socket.timeout, TimeoutError):
-        return True, []
-    r = json.loads(raw)
-    if r.get("ret", 0) != 0:
-        log.warning("getupdates ret!=0: %s", raw[:300]); return False, []
-    st = load_state()  # re-read to minimise clobbering concurrent writers
-    if r.get("get_updates_buf"): st["get_updates_buf"] = r["get_updates_buf"]
-    msgs = r.get("msgs") or []
+        raw = ilink.post("ilink/bot/getupdates", {"get_updates_buf": st.get("get_updates_buf", "")}, timeout=40)
+    except TimeoutError:
+        return {"kind": "timeout"}
+    except Exception as e:
+        return {"kind": "transient", "error": type(e).__name__}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return {"kind": "transient", "error": "bad json"}
+    kind = guard.classify_poll(parsed)
+    if kind == "auth":
+        log.error("getupdates auth expired ret/errcode=-14")
+        return {"kind": "auth", "ret": -14}
+    if kind != "ok":
+        log.warning("getupdates transient ret=%s", guard.ilink_error_code(parsed))
+        return {"kind": "transient", "ret": guard.ilink_error_code(parsed)}
+    st = ilink.load_state()  # re-read to minimise clobbering concurrent writers
+    if parsed.get("get_updates_buf"):
+        st["get_updates_buf"] = parsed["get_updates_buf"]
+    msgs = parsed.get("msgs") or []
     for m in msgs:
         if m.get("message_type") == 1 and m.get("from_user_id"):
             st["last_from_user_id"] = m["from_user_id"]
@@ -69,8 +89,7 @@ def fetch():
             st["last_inbound_ms"] = max(st.get("last_inbound_ms") or 0, m.get("create_time_ms") or int(time.time() * 1000))
     if msgs:
         st["raw_log"] = (st.get("raw_log", []) + msgs)[-20:]
-    save_state(st)
-    return True, msgs
+    return {"kind": "ok", "msgs": msgs, "state": st, "save": bool(msgs or parsed.get("get_updates_buf"))}
 
 ATTACH_DIR = config.ATTACH_DIR
 MEDIA_TYPES = (2, 3, 4, 5)  # image, voice, file, video
@@ -134,11 +153,16 @@ class Batcher:
 
     def add(self, payload):
         with self.lock:
+            mid = payload.get("message_id")
+            if mid is not None and any(m.get("message_id") == mid for m in self.msgs):
+                log.info("skip duplicate pending message_id=%s", mid)
+                return False
             now = self.clock()
             if not self.msgs: self.oldest = now
             self.msgs.append(payload); self.last = now
             self._save()
-            log.info("buffered message_id=%s (pending=%d)", payload.get("message_id"), len(self.msgs))
+            log.info("buffered message_id=%s (pending=%d)", mid, len(self.msgs))
+            return True
 
     def due(self):
         now = self.clock()
@@ -194,20 +218,73 @@ class Batcher:
             except Exception as e: log.warning("flusher error: %s: %s", type(e).__name__, e)
             time.sleep(interval)
 
-def handle(msgs, batcher):
-    seen = load_seen()
+def handle(msgs, batcher, quarantine=None, seen_path=None, rules=None, backlog_before_ms=None):
+    seen_path = seen_path or SEEN
+    rules = [] if rules is None else rules
+    seen = load_seen(seen_path)
+    changed = False
     for m in msgs:
         if m.get("message_type") != 1: continue
         mid = m.get("message_id")
         if mid is not None and mid in seen: continue
         payload = build_payload(m)
         payload["prev_inbound_ms"] = m.get("_prev_inbound_ms")
-        log.info("received message_id=%s from=%s types=%s files=%s", mid, m.get("from_user_id"),
+        route = guard.route_payload(payload, rules, quarantine, batcher.add, backlog_before_ms)
+        log.info("received message_id=%s route=%s types=%s files=%s", mid, route,
                  payload["item_types"], payload.get("files"))
-        batcher.add(payload)
         if mid is not None:
             seen = (seen + [mid])[-500:]
-            json.dump(seen, open(SEEN, "w"))
+            changed = True
+    if changed:
+        guard.atomic_json(seen_path, seen)
+
+def step(batcher, quarantine, alerter, fails, fetch=None, sleep=None, save_state=None,
+         seen_path=None, rules=None, backlog_before_ms=None, heartbeat_path=None):
+    """One poll. Returns (action, fails). action is ok, backoff, or stop_auth.
+
+    The cursor is written only after pending/quarantine/seen are on disk.
+    Auth (-14) does not sleep and does not ask for another poll.
+    """
+    poll_fn = fetch if fetch is not None else sys.modules[__name__].fetch
+    sleep = sleep or time.sleep
+    save_state_fn = save_state or ilink.save_state
+    seen_path = seen_path or SEEN
+    if rules is None:
+        rules = guard.load_rules(os.path.join(DIR, "quarantine-rules.json"))
+    hb = heartbeat_path or HEARTBEAT
+    guard.write_heartbeat(hb, "in_poll")
+    try:
+        outcome = poll_fn()
+    except Exception as e:
+        outcome = {"kind": "transient", "error": type(e).__name__}
+    if not isinstance(outcome, dict):
+        outcome = {"kind": "transient", "error": "bad outcome"}
+    kind = outcome.get("kind")
+    if kind not in ("ok", "timeout", "auth", "transient"):
+        kind = "transient"
+    if kind == "auth":
+        guard.write_heartbeat(hb, "auth_expired", ret=-14)
+        alerter.fail("auth_expired", guard.AUTH_TEXT)
+        return "stop_auth", fails
+    if kind == "transient":
+        fails += 1
+        delay = guard.backoff_seconds(fails)
+        guard.write_heartbeat(hb, "backing_off", ret=outcome.get("ret"))
+        if fails >= guard.TRANSIENT_ALERT_AFTER:
+            alerter.fail("receive_degraded", guard.TRANSIENT_TEXT)
+        log.warning("transient getupdates failure #%s sleep %ss (%s)", fails, delay,
+                    outcome.get("error") or outcome.get("ret"))
+        sleep(delay)
+        return "backoff", fails
+    if fails:
+        alerter.recover(guard.RECOVER_TEXT)
+    fails = 0
+    guard.write_heartbeat(hb, "polling", ret=0)
+    if kind == "ok":
+        def persist(msgs):
+            handle(msgs, batcher, quarantine, seen_path, rules, backlog_before_ms)
+        guard.commit_poll(outcome, persist, save_state_fn)
+    return "ok", fails
 
 def outbox_loop():
     """Flush queued sends right after the user writes; nudge near window end."""
@@ -224,27 +301,41 @@ def outbox_loop():
             log.warning("outbox loop error: %s: %s", type(e).__name__, e)
         time.sleep(15)
 
+def _deliver_alert(payload):
+    result = post_webhook(payload, tries=1)
+    if not (isinstance(result, tuple) and 200 <= int(result[0]) < 300):
+        raise RuntimeError("alert webhook failed")
+    return result
+
 def main():
-    log.info("forwarder start pid=%d url_set=%s key_present=%s quiet=%ds cap=%ds", os.getpid(), bool(WEBHOOK_URL),
-             bool(webhook_key()), QUIET_S, CAP_S)
+    lock = guard.adopt_or_lock(os.path.join(DIR, "receiver.lock"))
+    if lock is None:
+        log.error("another receiver holds the lock; not polling")
+        sys.exit(guard.LOCK_EXIT)
+    globals()["_receiver_lock"] = lock  # keep the inherited or acquired fd open
+    backlog = os.environ.get("WECHAT_QUARANTINE_BACKLOG", "").strip().lower() in ("1", "true", "yes")
+    backlog_before = int(time.time() * 1000) if backlog else None
+    log.info("forwarder start pid=%d url_set=%s key_present=%s quiet=%ds cap=%ds backlog_before=%s",
+             os.getpid(), bool(WEBHOOK_URL), bool(webhook_key()), QUIET_S, CAP_S, backlog_before)
     batcher = Batcher()
+    store = guard.QuarantineStore(os.path.join(DIR, "quarantine.json"))
+    alerter = guard.AlertDeduper(os.path.join(DIR, "alert_state.json"), _deliver_alert)
     threading.Thread(target=batcher.run, daemon=True, name="flusher").start()
     threading.Thread(target=outbox_loop, daemon=True, name="outbox").start()
     fails = 0
     while True:
-        try: open(HEARTBEAT, "w").write(str(int(time.time())))   # "loop is alive" (not "network is fine")
-        except OSError: pass
         try:
-            ok, msgs = fetch()
-            if ok:
-                fails = 0
-                if msgs: handle(msgs, batcher)
-            else:
-                fails += 1
-                time.sleep(60 if fails >= 3 else 10)
+            action, fails = step(batcher, store, alerter, fails, backlog_before_ms=backlog_before)
         except Exception as e:
-            log.warning("poll error: %s: %s", type(e).__name__, e)
-            time.sleep(10)
+            fails += 1
+            log.warning("poll step error: %s: %s", type(e).__name__, e)
+            try: guard.write_heartbeat(HEARTBEAT, "backing_off")
+            except OSError: pass
+            time.sleep(guard.backoff_seconds(fails))
+            continue
+        if action == "stop_auth":
+            log.error("getupdates auth expired (-14); polling stopped until re-bind. send.py is unaffected")
+            guard.hold_auth(time.sleep, lambda status: guard.write_heartbeat(HEARTBEAT, status, ret=-14))
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv:

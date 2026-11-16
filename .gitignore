@@ -17,6 +17,15 @@ outbox.json.tmp
 forward_seen.json
 history.log
 forward.heartbeat
+forward.heartbeat.tmp
+receiver.lock
+supervisor.pid
+supervisor.out
+alert_state.json
+alert_state.json.tmp
+quarantine.json
+quarantine.json.tmp
+quarantine-rules.json
 
 # logs / pids
 *.log

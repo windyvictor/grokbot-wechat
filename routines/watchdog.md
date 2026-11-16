@@ -7,13 +7,14 @@
 
 **指令（贴进 routine）：**
 
-运行 `bash /path/to/grokbot-wechat-bridge/watchdog.sh`，它只输出一行：
+运行 `bash /path/to/grokbot-wechat/watchdog.sh`，它只输出一行：
 
-- `OK pid=…`：一切正常。**什么都不用做，不要发任何消息，安静结束。**
-- `RESTARTED (原因) pid=…`：转发器挂了已自动拉起（多半是机器重启过）。不用通知用户；如果一天内重启超过 3 次，
-  再用 `send.py --app "微信转发器今天重启了 N 次，原因：…"` 提醒一次。
-- `FAILED (原因)`：拉不起来。看 `forward.out` 和 `forward.log` 末尾 30 行找原因（常见：缺依赖、`credentials.json`
-  丢了 / token 失效需重新 `bind.py`、`.env` 没配）。能修就修好后再跑一次 watchdog.sh；修不了就把原因简短告诉用户。
+- `OK …`：监管进程或本目录的接收进程已在。**什么都不用做，不要发任何消息，安静结束。**
+- `RESTARTED (supervisor absent) pid=…`：监管进程不在，已拉起。不用再手动启动第二个。
+- `AUTH_EXPIRED …`：登录态失效，脚本**不会**重启轮询。不要循环启动，也不要再发一条微信。接收器已经用 webhook 告警过一次。安静结束。重新绑定由人在机器上做完 `bind.py` 后再启动 `supervise.sh`。
+- `FAILED …`：拉不起来。看 `supervisor.out` 和 `forward.log` 末尾。常见原因：缺依赖、`credentials.json` 丢失、另一个接收进程占着锁。修不了就把原因简短告诉用户。
+
+`nohup` 不能代替这条 routine 或 cron。容器 PID1 是 tini 且没有 cron/systemd 时，这条指令本身也不会在重启后自动出现。
 
 注意：
 - 不要同时手动再启一个 `run_forward.sh`，两个轮询器共用一个 getupdates 游标会互相"偷"消息。

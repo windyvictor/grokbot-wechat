@@ -1,12 +1,9 @@
 #!/bin/bash
-# Inner watchdog: restarts forward.py whenever it exits. The PID of THIS loop is written to forward.pid.
-# Start it detached, e.g.:  nohup setsid ./run_forward.sh >/dev/null 2>&1 &
-# It does not survive a machine/box restart; watchdog.sh (run every 15 min) covers that.
+# Compatibility entry. The stock receiver is now ./supervise.sh (singleton, backoff, hang).
+# A deployed tree may have a locally modified copy of this file plus an untracked
+# start_forward.sh. Do not overwrite those blindly; compare and keep local path/env
+# changes, then point the local starter at supervise.sh.
+#
+# nohup/setsid is not restart persistence across a container stop when PID1 is tini.
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
-LOGDIR="${BRIDGE_DATA_DIR:-.}"
-echo $$ > "$LOGDIR/forward.pid"
-while true; do
-  python3 -u forward.py >> "$LOGDIR/forward.out" 2>&1
-  echo "$(date '+%F %T') forward.py exited ($?), restarting in 5s" >> "$LOGDIR/forward.log"
-  sleep 5
-done
+exec ./supervise.sh
