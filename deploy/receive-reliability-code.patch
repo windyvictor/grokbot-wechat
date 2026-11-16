@@ -1,0 +1,1354 @@
+diff --git a/forward.py b/forward.py
+index 5117149..9e10ad8 100755
+--- a/forward.py
++++ b/forward.py
+@@ -1,18 +1,23 @@
+ #!/usr/bin/env python3
+ """Forward WeChat ClawBot user messages (message_type==1) to a Grok Bot webhook routine.
+-Loops forever on ilink/bot/getupdates (same cursor/state handling as poll.py). Logs to forward.log.
++Loops on ilink/bot/getupdates (same cursor/state handling as poll.py). Logs to forward.log.
+ Three threads:
+   main     long-poll getupdates -> dedupe -> download media -> append to pending.json
+   flusher  POST pending.json as one batch once the user pauses (BATCH_QUIET_S) or after BATCH_CAP_S
+   outbox   flush queued sends right after the user writes; keep-alive nudge before the ~24h window closes
++Login expiry (ret/errcode -14) stops polling and alerts once; it does not retry and does not affect send.py.
++WECHAT_QUARANTINE_BACKLOG=1 or quarantine-rules.json holds matching messages for inspection instead of posting them.
++Prefer ./supervise.sh over running this file under a bare restart loop.
+ Usage: python3 forward.py [--selftest]"""
+-import json, os, socket, sys, threading, time, logging, urllib.request, urllib.error
+-from ilink import post, load_state, save_state, DIR
++import json, os, sys, threading, time, logging, urllib.request, urllib.error
++import ilink
++import receive_supervisor as guard
++from ilink import DIR
+ import config, media, history, outbox
+ from config import WEBHOOK_URL, webhook_key, OWNER_NAME
+ 
+ SEEN = os.path.join(DIR, "forward_seen.json")      # recent message_ids, for dedupe
+-HEARTBEAT = os.path.join(DIR, "forward.heartbeat") # touched after every long-poll; watchdog.sh checks its age
++HEARTBEAT = os.path.join(DIR, "forward.heartbeat") # JSON progress stamp; stale in_poll means the long-poll is hung
+ logging.basicConfig(filename=os.path.join(DIR, "forward.log"), level=logging.INFO,
+                     format="%(asctime)s %(levelname)s %(message)s")
+ log = logging.getLogger("forward")
+@@ -43,23 +48,38 @@ def post_webhook(payload, tries=5):
+     log.error("webhook gave up after %d tries", tries)
+     return None
+ 
+-def load_seen():
+-    try: return json.load(open(SEEN))
++def load_seen(path=None):
++    try: return json.load(open(path or SEEN))
+     except Exception: return []
+ 
+ def fetch():
+-    """One long-poll. Returns (ok, msgs). Mirrors poll.once() state updates."""
+-    st = load_state()
++    """One long-poll. Does not write state.json; the caller persists messages first.
++
++    Returns a dict: kind is ok, timeout, transient, or auth. Timeout is a normal
++    empty long-poll. auth means ret/errcode -14 (login expired): do not retry.
++    """
++    st = ilink.load_state()
++    try:
++        raw = ilink.post("ilink/bot/getupdates", {"get_updates_buf": st.get("get_updates_buf", "")}, timeout=40)
++    except TimeoutError:
++        return {"kind": "timeout"}
++    except Exception as e:
++        return {"kind": "transient", "error": type(e).__name__}
+     try:
+-        raw = post("ilink/bot/getupdates", {"get_updates_buf": st.get("get_updates_buf", "")}, timeout=40)
+-    except (socket.timeout, TimeoutError):
+-        return True, []
+-    r = json.loads(raw)
+-    if r.get("ret", 0) != 0:
+-        log.warning("getupdates ret!=0: %s", raw[:300]); return False, []
+-    st = load_state()  # re-read to minimise clobbering concurrent writers
+-    if r.get("get_updates_buf"): st["get_updates_buf"] = r["get_updates_buf"]
+-    msgs = r.get("msgs") or []
++        parsed = json.loads(raw)
++    except ValueError:
++        return {"kind": "transient", "error": "bad json"}
++    kind = guard.classify_poll(parsed)
++    if kind == "auth":
++        log.error("getupdates auth expired ret/errcode=-14")
++        return {"kind": "auth", "ret": -14}
++    if kind != "ok":
++        log.warning("getupdates transient ret=%s", guard.ilink_error_code(parsed))
++        return {"kind": "transient", "ret": guard.ilink_error_code(parsed)}
++    st = ilink.load_state()  # re-read to minimise clobbering concurrent writers
++    if parsed.get("get_updates_buf"):
++        st["get_updates_buf"] = parsed["get_updates_buf"]
++    msgs = parsed.get("msgs") or []
+     for m in msgs:
+         if m.get("message_type") == 1 and m.get("from_user_id"):
+             st["last_from_user_id"] = m["from_user_id"]
+@@ -69,8 +89,7 @@ def fetch():
+             st["last_inbound_ms"] = max(st.get("last_inbound_ms") or 0, m.get("create_time_ms") or int(time.time() * 1000))
+     if msgs:
+         st["raw_log"] = (st.get("raw_log", []) + msgs)[-20:]
+-    save_state(st)
+-    return True, msgs
++    return {"kind": "ok", "msgs": msgs, "state": st, "save": bool(msgs or parsed.get("get_updates_buf"))}
+ 
+ ATTACH_DIR = config.ATTACH_DIR
+ MEDIA_TYPES = (2, 3, 4, 5)  # image, voice, file, video
+@@ -130,15 +149,22 @@ class Batcher:
+         tmp = self.path + ".tmp"
+         with open(tmp, "w") as f:
+             json.dump({"messages": self.msgs, "oldest": self.oldest, "last": self.last}, f, ensure_ascii=False)
++            f.flush()
++            os.fsync(f.fileno())
+         os.replace(tmp, self.path)
+ 
+     def add(self, payload):
+         with self.lock:
++            mid = payload.get("message_id")
++            if mid is not None and any(m.get("message_id") == mid for m in self.msgs):
++                log.info("skip duplicate pending message_id=%s", mid)
++                return False
+             now = self.clock()
+             if not self.msgs: self.oldest = now
+             self.msgs.append(payload); self.last = now
+             self._save()
+-            log.info("buffered message_id=%s (pending=%d)", payload.get("message_id"), len(self.msgs))
++            log.info("buffered message_id=%s (pending=%d)", mid, len(self.msgs))
++            return True
+ 
+     def due(self):
+         now = self.clock()
+@@ -194,20 +220,74 @@ class Batcher:
+             except Exception as e: log.warning("flusher error: %s: %s", type(e).__name__, e)
+             time.sleep(interval)
+ 
+-def handle(msgs, batcher):
+-    seen = load_seen()
++def handle(msgs, batcher, quarantine=None, seen_path=None, rules=None, backlog_before_ms=None, heartbeat_path=None):
++    seen_path = seen_path or SEEN
++    rules = [] if rules is None else rules
++    seen = load_seen(seen_path)
+     for m in msgs:
+         if m.get("message_type") != 1: continue
+         mid = m.get("message_id")
+         if mid is not None and mid in seen: continue
++        if heartbeat_path:
++            guard.write_heartbeat(heartbeat_path, "persisting")
+         payload = build_payload(m)
+         payload["prev_inbound_ms"] = m.get("_prev_inbound_ms")
+-        log.info("received message_id=%s from=%s types=%s files=%s", mid, m.get("from_user_id"),
++        route = guard.route_payload(payload, rules, quarantine, batcher.add, backlog_before_ms)
++        log.info("received message_id=%s route=%s types=%s files=%s", mid, route,
+                  payload["item_types"], payload.get("files"))
+-        batcher.add(payload)
+         if mid is not None:
+             seen = (seen + [mid])[-500:]
+-            json.dump(seen, open(SEEN, "w"))
++            guard.atomic_json(seen_path, seen)
++
++def step(batcher, quarantine, alerter, fails, fetch=None, sleep=None, save_state=None,
++         seen_path=None, rules=None, backlog_before_ms=None, heartbeat_path=None):
++    """One poll. Returns (action, fails). action is ok, backoff, or stop_auth.
++
++    The cursor is written only after pending/quarantine/seen are on disk.
++    Auth (-14) does not sleep and does not ask for another poll.
++    """
++    poll_fn = fetch if fetch is not None else sys.modules[__name__].fetch
++    sleep = sleep or time.sleep
++    save_state_fn = save_state or save_polled_state
++    seen_path = seen_path or SEEN
++    if rules is None:
++        rules = guard.load_rules(os.path.join(DIR, "quarantine-rules.json"))
++    hb = heartbeat_path or HEARTBEAT
++    guard.write_heartbeat(hb, "in_poll")
++    try:
++        outcome = poll_fn()
++    except Exception as e:
++        outcome = {"kind": "transient", "error": type(e).__name__}
++    if not isinstance(outcome, dict):
++        outcome = {"kind": "transient", "error": "bad outcome"}
++    kind = outcome.get("kind")
++    if kind not in ("ok", "timeout", "auth", "transient"):
++        kind = "transient"
++    if kind == "auth":
++        guard.write_heartbeat(hb, "auth_expired", ret=-14)
++        alerter.fail("auth_expired", guard.AUTH_TEXT)
++        return "stop_auth", fails
++    if kind == "transient":
++        fails += 1
++        delay = guard.backoff_seconds(fails)
++        guard.write_heartbeat(hb, "backing_off", ret=outcome.get("ret"))
++        if fails >= guard.TRANSIENT_ALERT_AFTER:
++            alerter.fail("receive_degraded", guard.TRANSIENT_TEXT)
++        log.warning("transient getupdates failure #%s sleep %ss (%s)", fails, delay,
++                    outcome.get("error") or outcome.get("ret"))
++        sleep(delay)
++        return "backoff", fails
++    try:
++        alerter.recover(guard.RECOVER_TEXT)
++    except Exception as e:
++        log.warning("recovery alert failed: %s", type(e).__name__)
++    fails = 0
++    guard.write_heartbeat(hb, "polling", ret=0)
++    if kind == "ok":
++        def persist(msgs):
++            handle(msgs, batcher, quarantine, seen_path, rules, backlog_before_ms, heartbeat_path=hb)
++        guard.commit_poll(outcome, persist, save_state_fn)
++    return "ok", fails
+ 
+ def outbox_loop():
+     """Flush queued sends right after the user writes; nudge near window end."""
+@@ -224,27 +304,78 @@ def outbox_loop():
+             log.warning("outbox loop error: %s: %s", type(e).__name__, e)
+         time.sleep(15)
+ 
++def save_polled_state(snapshot):
++    """Write the polled cursor without dropping fields another thread saved meanwhile."""
++    def merge(current):
++        if snapshot.get("get_updates_buf"):
++            current["get_updates_buf"] = snapshot["get_updates_buf"]
++        if snapshot.get("last_from_user_id"):
++            current["last_from_user_id"] = snapshot["last_from_user_id"]
++        tokens = snapshot.get("context_tokens") or {}
++        if tokens:
++            current.setdefault("context_tokens", {}).update(tokens)
++        inbound = snapshot.get("last_inbound_ms")
++        if inbound:
++            current["last_inbound_ms"] = max(current.get("last_inbound_ms") or 0, inbound)
++        if "raw_log" in snapshot:
++            current["raw_log"] = snapshot["raw_log"]
++    ilink.mutate_state(merge)
++
++def quarantine_backlog_enabled(value=None):
++    """True only for the one-time recovery switch.
++
++    Unset, empty, and 0 leave held quarantine rows and seen ids in place and
++    deliver later downtime messages through pending as usual.
++    """
++    if value is None:
++        value = os.environ.get("WECHAT_QUARANTINE_BACKLOG", "")
++    return str(value).strip().lower() in ("1", "true", "yes")
++
++def prepare_recovery_buffers(pending_path, store, enabled):
++    """Sweep pending into quarantine only while the one-time switch is on."""
++    if not enabled:
++        return []
++    return guard.sweep_preexisting_pending(pending_path, store)
++
++def _deliver_alert(payload):
++    result = post_webhook(payload, tries=1)
++    if not (isinstance(result, tuple) and 200 <= int(result[0]) < 300):
++        raise RuntimeError("alert webhook failed")
++    return result
++
+ def main():
+-    log.info("forwarder start pid=%d url_set=%s key_present=%s quiet=%ds cap=%ds", os.getpid(), bool(WEBHOOK_URL),
+-             bool(webhook_key()), QUIET_S, CAP_S)
++    lock = guard.adopt_or_lock(os.path.join(DIR, "receiver.lock"))
++    if lock is None:
++        log.error("another receiver holds the lock; not polling")
++        sys.exit(guard.LOCK_EXIT)
++    globals()["_receiver_lock"] = lock  # keep the inherited or acquired fd open
++    backlog = quarantine_backlog_enabled()
++    backlog_before = int(time.time() * 1000) if backlog else None
++    log.info("forwarder start pid=%d url_set=%s key_present=%s quiet=%ds cap=%ds backlog_before=%s",
++             os.getpid(), bool(WEBHOOK_URL), bool(webhook_key()), QUIET_S, CAP_S, backlog_before)
++    store = guard.QuarantineStore(os.path.join(DIR, "quarantine.json"))
++    moved = prepare_recovery_buffers(PENDING, store, backlog)
++    if moved:
++        log.info("quarantined %d preexisting pending message(s)", len(moved))
+     batcher = Batcher()
++    alerter = guard.AlertDeduper(os.path.join(DIR, "alert_state.json"), _deliver_alert)
+     threading.Thread(target=batcher.run, daemon=True, name="flusher").start()
+     threading.Thread(target=outbox_loop, daemon=True, name="outbox").start()
+     fails = 0
+     while True:
+-        try: open(HEARTBEAT, "w").write(str(int(time.time())))   # "loop is alive" (not "network is fine")
+-        except OSError: pass
+         try:
+-            ok, msgs = fetch()
+-            if ok:
+-                fails = 0
+-                if msgs: handle(msgs, batcher)
+-            else:
+-                fails += 1
+-                time.sleep(60 if fails >= 3 else 10)
++            action, fails = step(batcher, store, alerter, fails, backlog_before_ms=backlog_before)
+         except Exception as e:
+-            log.warning("poll error: %s: %s", type(e).__name__, e)
+-            time.sleep(10)
++            fails += 1
++            log.warning("poll step error: %s: %s", type(e).__name__, e)
++            try: guard.write_heartbeat(HEARTBEAT, "backing_off")
++            except OSError: pass
++            time.sleep(guard.backoff_seconds(fails))
++            continue
++        if action == "stop_auth":
++            log.error("getupdates auth expired (-14); polling stopped until re-bind. send.py is unaffected")
++            guard.hold_auth(time.sleep, lambda status: guard.write_heartbeat(HEARTBEAT, status, ret=-14),
++                            retry_alert=lambda: alerter.fail("auth_expired", guard.AUTH_TEXT))
+ 
+ if __name__ == "__main__":
+     if "--selftest" in sys.argv:
+diff --git a/ilink.py b/ilink.py
+index c55a3c7..2854074 100644
+--- a/ilink.py
++++ b/ilink.py
+@@ -1,7 +1,7 @@
+ """Minimal WeChat ClawBot iLink client.
+ Protocol notes: https://chihao.li/blog/en/wechat-clawbot-ilink-protocol and the
+ @tencent-weixin/openclaw-weixin 2.4.9 npm package (headers / base_info mimic that client)."""
+-import base64, json, os, random, secrets, urllib.request
++import base64, fcntl, json, os, random, secrets, threading, urllib.request
+ from config import DATA_DIR
+ DIR = DATA_DIR
+ CRED = os.path.join(DIR, "credentials.json")   # written by bind.py; NEVER commit
+@@ -14,11 +14,30 @@ def creds():
+ def load_state():
+     return json.load(open(STATE)) if os.path.exists(STATE) else {}
+ 
++_STATE_THREAD = threading.Lock()
++
+ def save_state(s):
+     tmp = STATE + ".tmp"
+-    with open(tmp, "w") as f: json.dump(s, f, indent=2, ensure_ascii=False)
++    with open(tmp, "w") as f:
++        json.dump(s, f, indent=2, ensure_ascii=False)
++        f.flush()
++        os.fsync(f.fileno())
+     os.chmod(tmp, 0o600); os.replace(tmp, STATE)
+ 
++def mutate_state(mutator):
++    """Reload state.json, apply mutator, and save, serialized across threads and processes."""
++    lock_path = STATE + ".lock"
++    with _STATE_THREAD:
++        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
++        try:
++            fcntl.flock(fd, fcntl.LOCK_EX)
++            st = load_state()
++            mutator(st)
++            save_state(st)
++        finally:
++            fcntl.flock(fd, fcntl.LOCK_UN)
++            os.close(fd)
++
+ def post(endpoint, body, timeout=15):
+     c = creds()
+     hdrs = {"Content-Type": "application/json", "AuthorizationType": "ilink_bot_token",
+diff --git a/install_autostart.py b/install_autostart.py
+new file mode 100755
+index 0000000..74fb31a
+--- /dev/null
++++ b/install_autostart.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++"""Report or install receive-supervisor autostart. Never treats nohup as persistence.
++
++--check   print JSON {pid1, mechanism, installed} and exit 0
++--install install a systemd --user unit only when PID1 is systemd and systemctl
++          is running, or a crontab line only when cron/crond is running, then
++          re-read the enabled state. Otherwise print the runtime-only limit and
++          exit 2 without writing a unit.
++"""
++import json, os, subprocess, sys
++import receive_supervisor as guard
++
++REPO = os.path.dirname(os.path.abspath(__file__))
++
++
++def live_detect():
++    try:
++        pid1 = open("/proc/1/comm", encoding="utf-8").read().strip()
++    except OSError:
++        pid1 = ""
++    systemd_running = False
++    if pid1 == "systemd":
++        try:
++            probe = subprocess.run(["systemctl", "is-system-running"], capture_output=True, text=True)
++            systemd_running = probe.returncode == 0
++        except (OSError, subprocess.SubprocessError):
++            systemd_running = False
++    cron_running = False
++    try:
++        names = set(subprocess.check_output(["ps", "-eo", "comm"], text=True).split())
++        cron_running = bool(names & {"cron", "crond"})
++    except (OSError, subprocess.SubprocessError):
++        cron_running = False
++    return guard.detect_autostart(pid1, systemd_running, cron_running)
++
++
++def _write_unit(text):
++    dest_dir = os.path.expanduser("~/.config/systemd/user")
++    os.makedirs(dest_dir, exist_ok=True)
++    dest = os.path.join(dest_dir, "grokbot-wechat-receive.service")
++    tmp = dest + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(text)
++    os.replace(tmp, dest)
++    return dest
++
++
++def _enable_unit(_path):
++    subprocess.check_call(["systemctl", "--user", "daemon-reload"])
++    subprocess.check_call(["systemctl", "--user", "enable", "--now", "grokbot-wechat-receive.service"])
++    out = subprocess.check_output(
++        ["systemctl", "--user", "is-enabled", "grokbot-wechat-receive.service"], text=True).strip()
++    return out
++
++
++def _install_cron(repo_dir):
++    line = "*/5 * * * * %s/watchdog.sh" % repo_dir
++    current = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
++    body = current.stdout if current.returncode == 0 else ""
++    if line not in body:
++        body = body.rstrip() + "\n" + line + "\n"
++        wrote = subprocess.run(["crontab", "-"], input=body, text=True)
++        if wrote.returncode != 0:
++            raise RuntimeError("crontab rejected the watchdog line")
++    check = subprocess.check_output(["crontab", "-l"], text=True)
++    if line not in check:
++        raise RuntimeError("crontab did not list the watchdog line after install")
++
++
++def install(info):
++    if info.get("mechanism") == "systemd":
++        return guard.install_autostart(info, repo_dir=REPO, write_unit=_write_unit, enable_unit=_enable_unit)
++    if info.get("mechanism") == "cron":
++        return guard.install_autostart(info, repo_dir=REPO, install_cron=_install_cron)
++    return guard.install_autostart(info, repo_dir=REPO)
++
++
++def main(argv):
++    info = live_detect()
++    if "--install" in argv:
++        rc, message = install(info)
++        print(message)
++        return rc
++    print(json.dumps(info, ensure_ascii=False))
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv[1:]))
+diff --git a/outbox.py b/outbox.py
+index 81c9e1a..c5ebd46 100644
+--- a/outbox.py
++++ b/outbox.py
+@@ -8,7 +8,7 @@ import json, os, time, logging
+ from datetime import datetime
+ from zoneinfo import ZoneInfo
+ from config import QUIET_TZ, NUDGE_TEXT, quiet_hours
+-from ilink import DIR, load_state, save_state, send_text
++from ilink import DIR, load_state, mutate_state, save_state, send_text
+ BJ = ZoneInfo(QUIET_TZ)
+ 
+ OUTBOX = os.path.join(DIR, "outbox.json")   # queued texts; may contain private content, NEVER commit
+@@ -85,6 +85,6 @@ def maybe_nudge(now=None):
+     if age < NUDGE_AFTER_S and now < latest_ok_s(last) - NUDGE_MARGIN_S: return False
+     try: resp, _ = send_text(NUDGE_TEXT, context_token="")
+     except Exception as e: resp = "%s: %s" % (type(e).__name__, e)
+-    st = load_state(); st["nudged_for"] = last; save_state(st)  # one attempt per window
++    mutate_state(lambda st, _last=last: st.__setitem__("nudged_for", _last))  # one attempt per window
+     log.info("keepalive nudge sent=%s age=%.1fh", is_ok(resp), age / 3600)
+     return is_ok(resp)
+diff --git a/receive_supervisor.py b/receive_supervisor.py
+new file mode 100644
+index 0000000..fdc5b3b
+--- /dev/null
++++ b/receive_supervisor.py
+@@ -0,0 +1,766 @@
++#!/usr/bin/env python3
++"""Singleton supervisor for the WeChat receiver.
++
++The poller (forward.py) is a child. This process restarts it with a capped
++backoff after a crash or a stalled poll, and it does not restart an expired
++iLink login (ret/errcode -14). Alerts go out through the existing webhook,
++once per episode. No new network service is introduced.
++
++nohup is not restart persistence. install_autostart() only installs a unit
++when this machine's PID1 is systemd, or a crontab line when cron is running.
++"""
++import fcntl, json, logging, os, signal, subprocess, sys, time
++
++AUTH_EXIT = 14
++LOCK_EXIT = 2
++TRANSIENT_ALERT_AFTER = 5
++HANG_S = 150
++
++AUTH_TEXT = ("微信接收已停止：iLink 登录态失效（ret/errcode=-14）。需要重新扫码绑定后才能收消息。"
++             "接收器不会反复重试。发送功能不受影响。")
++TRANSIENT_TEXT = "微信接收连续多次网络失败，正在退避重试。发送功能不受影响。"
++RECOVER_TEXT = "微信接收已恢复，轮询重新有进展。"
++HUNG_TEXT = "微信接收轮询没有进展，已判定卡住并重启。发送功能不受影响。"
++UNSTABLE_TEXT = "微信接收进程反复退出，已按上限放慢重启。请查看本机日志，不要再开第二个轮询。"
++ALERT_TEXT = {"receiver_hung": HUNG_TEXT, "receiver_unstable": UNSTABLE_TEXT, "auth_expired": AUTH_TEXT,
++              "receive_degraded": TRANSIENT_TEXT, "recovered": RECOVER_TEXT}
++
++log = logging.getLogger("forward")
++
++
++class Decision:
++    def __init__(self, action, backoff, alert=None):
++        self.action, self.backoff, self.alert = action, backoff, alert
++
++
++def ilink_error_code(obj):
++    """0 when both fields are absent or zero. -14 if either field is -14.
++
++    Any other first non-zero value is returned as-is. Numeric strings count.
++    """
++    if not isinstance(obj, dict):
++        return 0
++    codes = []
++    for key in ("ret", "errcode"):
++        if key not in obj or obj[key] in (None, ""):
++            continue
++        try:
++            codes.append(int(obj[key]))
++        except (TypeError, ValueError):
++            continue
++    if -14 in codes:
++        return -14
++    for n in codes:
++        if n != 0:
++            return n
++    return 0
++
++
++def classify_poll(obj=None, exc=None):
++    """ok | timeout | transient | auth. Timeout is a normal empty long-poll."""
++    if exc is not None:
++        if isinstance(exc, TimeoutError):
++            return "timeout"
++        return "transient"
++    if ilink_error_code(obj) == -14:
++        return "auth"
++    if not isinstance(obj, dict) or ilink_error_code(obj) != 0:
++        return "transient"
++    return "ok"
++
++
++def backoff_seconds(attempt, base=2, cap=60):
++    """1-based consecutive failure count -> seconds, exponential and capped."""
++    n = max(1, int(attempt))
++    return min(int(cap), int(base) * (2 ** (n - 1)))
++
++
++class RestartPolicy:
++    """Crashes and hangs restart with a capped backoff. Auth stops."""
++
++    def __init__(self, base=2, cap=60, alert_after=5):
++        self.base, self.cap, self.alert_after = base, cap, alert_after
++        self.attempt = 0
++        self.alerted = False
++
++    def decide(self, kind, now=None):
++        if kind == "auth":
++            return Decision("stop", 0, "auth_expired")
++        self.attempt += 1
++        delay = backoff_seconds(self.attempt, self.base, self.cap)
++        alert = None
++        if self.attempt >= self.alert_after and not self.alerted:
++            alert = "receiver_hung" if kind == "hang" else "receiver_unstable"
++        return Decision("restart", delay, alert)
++
++    def note_alerted(self):
++        """Call only after the alert POST succeeded. A failed POST must be retried."""
++        self.alerted = True
++
++
++def hang_verdict(hb, now, hang_s, child_pid, spawned_at):
++    """Hang only on this child's own heartbeat.
++
++    A file left by the previous pid is not evidence that the new process is stuck.
++    The child has hang_s to write its own stamp. auth_expired on its own stamp is
++    never a hang.
++    """
++    hb = hb or {}
++    own = child_pid is not None and hb.get("pid") == child_pid
++    if not own:
++        if now - spawned_at > hang_s:
++            return "hang"
++        return "starting"
++    return assess_heartbeat(hb, now, hang_s, True)
++
++
++def assess_heartbeat(hb, now, hang_s, pid_alive):
++    """ok | starting | hang | dead | auth_expired.
++
++    auth_expired is never a hang: killing it would poll again and storm.
++    A missing heartbeat while the pid is alive is 'starting', not a hang.
++    """
++    if not pid_alive:
++        return "dead"
++    if not hb:
++        return "starting"
++    if hb.get("status") == "auth_expired":
++        return "auth_expired"
++    try:
++        updated = int(hb.get("updated_at") or 0)
++    except (TypeError, ValueError):
++        updated = 0
++    if now - updated > hang_s:
++        return "hang"
++    return "ok"
++
++
++def atomic_json(path, obj, mode=None):
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        json.dump(obj, f, ensure_ascii=False)
++        f.flush()
++        os.fsync(f.fileno())
++    if mode is not None:
++        os.chmod(tmp, mode)
++    os.replace(tmp, path)
++
++
++def write_heartbeat(path, status, now=None, ret=None):
++    doc = {"pid": os.getpid(), "status": status, "updated_at": int(time.time() if now is None else now)}
++    if ret is not None:
++        doc["last_ret"] = ret
++    atomic_json(path, doc)
++
++
++def read_heartbeat(path):
++    try:
++        with open(path, encoding="utf-8") as f:
++            doc = json.load(f)
++    except Exception:
++        return None
++    return doc if isinstance(doc, dict) else None
++
++
++def acquire_receiver_lock(path):
++    """Exclusive non-blocking lock. None if another receiver holds it.
++
++    The returned file object must stay open. The fd is inheritable so a child
++    poller keeps the singleton lock if this supervisor exits first.
++    """
++    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
++    try:
++        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++    except BlockingIOError:
++        os.close(fd)
++        return None
++    os.set_inheritable(fd, True)
++    os.ftruncate(fd, 0)
++    os.write(fd, str(os.getpid()).encode())
++    return os.fdopen(fd, "a+")
++
++
++def adopt_or_lock(path):
++    """Child path: keep WECHAT_LOCK_FD open. Otherwise take the lock ourselves."""
++    raw = os.environ.get("WECHAT_LOCK_FD")
++    if raw:
++        fd = int(raw)
++        os.set_inheritable(fd, True)
++        return os.fdopen(fd, "a+")
++    return acquire_receiver_lock(path)
++
++
++def receiver_pid_matches(pid, code_dir):
++    """True only for this checkout's forward.py / supervisor. Never a foreign inode."""
++    try:
++        cmd = open("/proc/%d/cmdline" % pid, "rb").read().replace(b"\0", b" ").decode("utf-8", "replace")
++        cwd = os.path.realpath(os.readlink("/proc/%d/cwd" % pid))
++    except OSError:
++        return False
++    if cwd != os.path.realpath(code_dir):
++        return False
++    return "forward.py" in cmd or "receive_supervisor.py" in cmd
++
++
++def _recorded_pids(hb, lock_path):
++    pids = []
++    if hb and hb.get("pid") is not None:
++        try:
++            pids.append(int(hb["pid"]))
++        except (TypeError, ValueError):
++            pass
++    try:
++        text = open(os.path.join(os.path.dirname(lock_path), "supervisor.pid"), encoding="utf-8").read()
++        pids.append(int(text.strip()))
++    except (OSError, ValueError):
++        pass
++    return pids
++
++
++def prepare_lock(path, read_heartbeat_fn, now, hang_s, kill, sleep, candidate_pids=None, is_ours=None, code_dir=None):
++    """Take the singleton lock.
++
++    A live or auth_expired holder is refused. A stale heartbeat may be replaced
++    by stopping only pids this receiver recorded, after a cmdline and cwd check.
++    """
++    lock = acquire_receiver_lock(path)
++    if lock is not None:
++        return lock
++    hb = read_heartbeat_fn()
++    if assess_heartbeat(hb, now, hang_s, True) != "hang":
++        return None
++    pids = list(candidate_pids()) if candidate_pids else _recorded_pids(hb, path)
++    mine = os.getpid()
++
++    def ours(pid):
++        if is_ours is not None:
++            return bool(is_ours(pid))
++        if not code_dir:
++            return False
++        return receiver_pid_matches(pid, code_dir)
++
++    for pid in pids:
++        if pid and pid != mine and ours(pid):
++            kill(pid)
++    for _ in range(25):
++        sleep(0.2)
++        lock = acquire_receiver_lock(path)
++        if lock is not None:
++            return lock
++    return None
++
++
++class AlertDeduper:
++    """One webhook post per open failure episode. Recovery clears it."""
++
++    def __init__(self, path, poster, clock=None, min_interval=900):
++        self.path, self.poster = path, poster
++        self.clock = clock or time.time
++        self.min_interval = min_interval
++        self.state = self._load()
++
++    def _load(self):
++        try:
++            with open(self.path, encoding="utf-8") as f:
++                doc = json.load(f)
++            if isinstance(doc, dict):
++                doc.setdefault("open", None)
++                return doc
++        except Exception:
++            pass
++        return {"open": None}
++
++    def _save(self):
++        atomic_json(self.path, self.state, mode=0o600)
++
++    def _body(self, kind, text):
++        return {"source": "wechat-clawbot", "alert": True, "notify_user": True,
++                "kind": kind, "text": text, "dedupe_key": kind}
++
++    def fail(self, kind, text):
++        if self.state.get("open") == kind:
++            return False
++        now = self.clock()
++        if (self.state.get("last_failed_kind") == kind and self.min_interval
++                and now - (self.state.get("last_failed_at") or 0) < self.min_interval):
++            return False
++        try:
++            self.poster(self._body(kind, text))
++        except Exception as e:
++            self.state["last_failed_kind"] = kind
++            self.state["last_failed_at"] = now
++            self._save()
++            log.warning("alert %s not delivered: %s", kind, type(e).__name__)
++            return False
++        self.state["open"] = kind
++        self.state["last_failed_kind"] = None
++        self.state["last_failed_at"] = None
++        self._save()
++        return True
++
++    def recover(self, text):
++        if not self.state.get("open"):
++            return False
++        now = self.clock()
++        if (self.state.get("last_failed_kind") == "recovered" and self.min_interval
++                and now - (self.state.get("last_failed_at") or 0) < self.min_interval):
++            return False
++        try:
++            self.poster(self._body("recovered", text))
++        except Exception as e:
++            self.state["last_failed_kind"] = "recovered"
++            self.state["last_failed_at"] = now
++            self._save()
++            log.warning("recovery alert not delivered: %s", type(e).__name__)
++            return False
++        self.state["open"] = None
++        self.state["last_failed_kind"] = None
++        self.state["last_failed_at"] = None
++        self._save()
++        return True
++
++
++def load_rules(path):
++    try:
++        with open(path, encoding="utf-8") as f:
++            doc = json.load(f)
++    except Exception:
++        return []
++    if isinstance(doc, dict):
++        rules = doc.get("rules") or []
++    elif isinstance(doc, list):
++        rules = doc
++    else:
++        return []
++    return [r for r in rules if isinstance(r, dict)]
++
++
++def match_quarantine(payload, rules):
++    """A rule matches only when every constraint it sets matches. Empty rules match nothing."""
++    texts = "".join(payload.get("texts") or [])
++    try:
++        ms = int(payload.get("create_time_ms") or 0)
++    except (TypeError, ValueError):
++        ms = 0
++    for rule in rules or []:
++        keys = ("message_id", "text_contains", "create_time_ms_min", "create_time_ms_max")
++        if not any(k in rule for k in keys):
++            continue
++        if "message_id" in rule and payload.get("message_id") != rule["message_id"]:
++            continue
++        if "text_contains" in rule and str(rule["text_contains"]) not in texts:
++            continue
++        if "create_time_ms_min" in rule and ms < int(rule["create_time_ms_min"]):
++            continue
++        if "create_time_ms_max" in rule and ms > int(rule["create_time_ms_max"]):
++            continue
++        return rule
++    return None
++
++
++def should_hold(payload, rules, backlog_before_ms=None):
++    try:
++        ms = int(payload.get("create_time_ms") or 0)
++    except (TypeError, ValueError):
++        ms = 0
++    if backlog_before_ms is not None and (not ms or ms < int(backlog_before_ms)):
++        return {"reason": "backlog"}
++    return match_quarantine(payload, rules)
++
++
++class QuarantineStore:
++    """Held inbound messages. Release changes status; the payload stays for audit."""
++
++    def __init__(self, path):
++        self.path = path
++
++    def _load(self):
++        try:
++            with open(self.path, encoding="utf-8") as f:
++                doc = json.load(f)
++        except Exception:
++            return {"items": []}
++        if not isinstance(doc, dict):
++            return {"items": []}
++        doc.setdefault("items", [])
++        return doc
++
++    def _save(self, doc):
++        atomic_json(self.path, doc, mode=0o600)
++
++    def items(self):
++        return list(self._load()["items"])
++
++    def hold(self, payload, rule):
++        doc = self._load()
++        mid = payload.get("message_id")
++        for item in doc["items"]:
++            if mid is not None and item.get("message_id") == mid:
++                return False
++        doc["items"].append({
++            "message_id": mid, "status": "held",
++            "reason": (rule or {}).get("reason") or "rule",
++            "held_at": time.time(), "released_at": None, "payload": payload,
++        })
++        self._save(doc)
++        return True
++
++    def release(self, message_id):
++        doc = self._load()
++        for item in doc["items"]:
++            if item.get("status") != "held":
++                continue
++            if item.get("message_id") != message_id and str(item.get("message_id")) != str(message_id):
++                continue
++            item["status"] = "released"
++            item["released_at"] = time.time()
++            self._save(doc)
++            return item.get("payload")
++        return None
++
++
++def sweep_preexisting_pending(pending_path, store):
++    """Move every message already in pending.json into the quarantine audit.
++
++    Used only for the recovery start. The pending file is replaced with an empty
++    document after the holds are on disk, so the flusher cannot post them.
++    """
++    try:
++        with open(pending_path, encoding="utf-8") as f:
++            doc = json.load(f)
++    except Exception:
++        return []
++    msgs = [m for m in (doc.get("messages") or []) if isinstance(m, dict)]
++    if not msgs:
++        return []
++    for payload in msgs:
++        store.hold(payload, {"reason": "preexisting-pending"})
++    atomic_json(pending_path, {"messages": [], "oldest": None, "last": None})
++    return msgs
++
++
++def route_payload(payload, rules, store, pending_add, backlog_before_ms=None):
++    rule = should_hold(payload, rules, backlog_before_ms)
++    if rule:
++        if store is not None:
++            store.hold(payload, rule)
++        return "held"
++    pending_add(payload)
++    return "pending"
++
++
++def commit_poll(outcome, persist, save_state):
++    """Persist inbound messages before the getupdates cursor is written."""
++    if outcome.get("msgs"):
++        persist(outcome["msgs"])
++    if outcome.get("save") and outcome.get("state") is not None:
++        save_state(outcome["state"])
++
++
++def hold_auth(sleep, beat, interval=30, cycles=None, retry_alert=None):
++    """Stay up without calling getupdates. A restart loop must not see us exit.
++
++    retry_alert is safe to call every interval: AlertDeduper suppresses repeats
++    and retries a failed POST only after its own gap.
++    """
++    n = 0
++    while cycles is None or n < cycles:
++        beat("auth_expired")
++        if retry_alert:
++            try:
++                retry_alert()
++            except Exception:
++                log.warning("auth alert retry failed")
++        sleep(interval)
++        n += 1
++
++
++def serve(spawn, policy, alerter, read_heartbeat_fn, clock, sleep, hang_s=HANG_S,
++          max_cycles=None, check_s=5, lock_path=None, stop_when=None):
++    """Run spawn() children until auth exit, stop_when, or max_cycles crashes.
++
++    lock_path is optional so tests can drive the loop without a lock. When set,
++    a held lock returns LOCK_EXIT and does not spawn.
++    """
++    lock = None
++    if lock_path is not None:
++        lock = acquire_receiver_lock(lock_path)
++        if lock is None:
++            return LOCK_EXIT
++    cycles = 0
++    while True:
++        if stop_when and stop_when():
++            return 0
++        spawned_at = clock()
++        proc = spawn(lock)
++        child_pid = getattr(proc, "pid", None)
++        hung = False
++        while proc.poll() is None:
++            if stop_when and stop_when():
++                proc.kill()
++                return 0
++            verdict = hang_verdict(read_heartbeat_fn(), clock(), hang_s, child_pid, spawned_at)
++            if verdict == "hang":
++                proc.kill()
++                hung = True
++                if proc.poll() is None and hasattr(proc, "wait"):
++                    try:
++                        proc.wait(timeout=2)
++                    except Exception:
++                        pass
++                if proc.poll() is None:
++                    proc.returncode = -9
++                break
++            sleep(check_s)
++        code = proc.poll()
++        if code is None:
++            code = getattr(proc, "returncode", None)
++        hb = read_heartbeat_fn() or {}
++        # A child that already recorded auth_expired must not be spawned again:
++        # its exit is the hold ending, not a crash. Match pid so a stale file
++        # from a previous process does not block a new child that has not
++        # written a heartbeat yet.
++        same_child = hb.get("pid") is not None and hb.get("pid") == getattr(proc, "pid", None)
++        if code == AUTH_EXIT or (hb.get("status") == "auth_expired" and same_child):
++            alerter.fail("auth_expired", AUTH_TEXT)
++            return AUTH_EXIT
++        cycles += 1
++        decision = policy.decide("hang" if hung else "crash", clock())
++        if decision.alert and alerter.fail(decision.alert, ALERT_TEXT.get(decision.alert, decision.alert)):
++            policy.note_alerted()
++        if decision.action == "stop":
++            return 1
++        sleep(decision.backoff)
++        if max_cycles is not None and cycles >= max_cycles:
++            return 0
++
++
++def detect_autostart(pid1, systemd_running, cron_running):
++    if pid1 == "systemd" and systemd_running:
++        mechanism = "systemd"
++    elif cron_running:
++        mechanism = "cron"
++    else:
++        mechanism = "runtime-only"
++    return {"pid1": pid1, "systemd_running": bool(systemd_running), "cron_running": bool(cron_running),
++            "mechanism": mechanism, "installed": False}
++
++
++def runtime_only_message(pid1):
++    return ("INSTALLED=no MECHANISM=runtime-only PID1=%s. "
++            "systemd is not PID1 and cron is not running, so no service was installed. "
++            "nohup/setsid only detaches the process; it is not restart persistence and will not "
++            "come back after this container stops. Run ./supervise.sh in the foreground from the "
++            "container entrypoint (or the existing long-lived session). An outer restart of the "
++            "container helps only when that entrypoint starts supervise.sh again."
++            % (pid1 or "unknown"))
++
++
++def systemd_unit_text(repo_dir):
++    repo_dir = os.path.abspath(repo_dir)
++    exe = os.path.join(repo_dir, "supervise.sh")
++    # Exit 14 (auth hold requested a stop) and exit 2 (another receiver holds the lock)
++    # must not be restarted by systemd, or a dead login becomes a poll storm.
++    return "\n".join([
++        "[Unit]",
++        "Description=grokbot-wechat receive supervisor",
++        "After=network-online.target",
++        "",
++        "[Service]",
++        "Type=simple",
++        "WorkingDirectory=%s" % repo_dir,
++        "ExecStart=%s" % exe,
++        "Restart=on-failure",
++        "RestartSec=5",
++        "RestartPreventExitStatus=2 14",
++        "",
++        "[Install]",
++        "WantedBy=default.target",
++        "",
++    ])
++
++
++def install_autostart(info, repo_dir=None, write_unit=None, enable_unit=None, install_cron=None):
++    """Install only a mechanism this process can verify. Runtime-only returns exit 2."""
++    if info.get("mechanism") == "runtime-only":
++        return 2, runtime_only_message(info.get("pid1"))
++    repo_dir = os.path.abspath(repo_dir or os.path.dirname(os.path.abspath(__file__)))
++    if info.get("mechanism") == "systemd":
++        if write_unit is None or enable_unit is None:
++            return 2, "systemd detected but no installer callbacks were provided; nothing written"
++        path = write_unit(systemd_unit_text(repo_dir))
++        enabled = enable_unit(path)
++        if enabled != "enabled":
++            return 2, "systemd unit written but is-enabled returned %r" % (enabled,)
++        return 0, "INSTALLED=systemd unit=%s enabled=yes" % path
++    if info.get("mechanism") == "cron":
++        if install_cron is None:
++            return 2, "cron detected but no installer callback was provided; nothing written"
++        install_cron(repo_dir)
++        return 0, "INSTALLED=cron"
++    return 2, runtime_only_message(info.get("pid1"))
++
++
++def spawn_forward(lock, code_dir):
++    env = os.environ.copy()
++    cmd = [sys.executable, "-u", os.path.join(code_dir, "forward.py")]
++    kwargs = {"cwd": code_dir, "env": env}
++    if lock is not None:
++        fd = lock.fileno()
++        os.set_inheritable(fd, True)
++        env["WECHAT_LOCK_FD"] = str(fd)
++        kwargs["pass_fds"] = (fd,)
++    return subprocess.Popen(cmd, **kwargs)
++
++
++def _data_paths():
++    import config
++    data = config.DATA_DIR
++    return data, config.CODE_DIR
++
++
++def _write_text(path, text):
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as f:
++        f.write(text)
++        f.flush()
++        os.fsync(f.fileno())
++    os.replace(tmp, path)
++
++
++def publish_supervisor_pid(lock, path):
++    """Record our pid only after the receiver lock is held.
++
++    A contender that did not get the lock must not create, replace, or remove
++    the owner's supervisor.pid.
++    """
++    if lock is None:
++        return False
++    _write_text(path, str(os.getpid()) + "\n")
++    return True
++
++
++def release_supervisor_pid(path):
++    """Remove supervisor.pid only when it still names this process."""
++    try:
++        with open(path, encoding="utf-8") as f:
++            current = f.read().strip()
++    except OSError:
++        return False
++    if current != str(os.getpid()):
++        return False
++    try:
++        os.remove(path)
++    except OSError:
++        return False
++    return True
++
++
++def run_serve():
++    import forward
++    data, code = _data_paths()
++    hb_path = os.path.join(data, "forward.heartbeat")
++    alert_path = os.path.join(data, "alert_state.json")
++    lock_path = os.path.join(data, "receiver.lock")
++    pid_path = os.path.join(data, "supervisor.pid")
++    stop = {"v": False}
++
++    def on_stop(signum, _frame):
++        stop["v"] = True
++        log.info("supervisor stop signal %s", signum)
++
++    signal.signal(signal.SIGTERM, on_stop)
++    signal.signal(signal.SIGINT, on_stop)
++
++    def poster(payload):
++        result = forward.post_webhook(payload, tries=1)
++        if not (isinstance(result, tuple) and 200 <= int(result[0]) < 300):
++            raise RuntimeError("alert webhook failed")
++        return result
++
++    def kill(pid):
++        try:
++            os.kill(pid, signal.SIGKILL)
++        except OSError:
++            pass
++
++    lock = prepare_lock(lock_path, lambda: read_heartbeat(hb_path), time.time(), HANG_S, kill, time.sleep,
++                        code_dir=code)
++    if not publish_supervisor_pid(lock, pid_path):
++        log.error("another receiver holds the lock and its heartbeat is not a hang; not starting")
++        return LOCK_EXIT
++    log.info("supervisor start pid=%s", os.getpid())
++    try:
++        # serve() also locks when given lock_path. We already hold it, so pass None and keep `lock` alive.
++        return serve(lambda _held: spawn_forward(lock, code), RestartPolicy(),
++                     AlertDeduper(alert_path, poster), lambda: read_heartbeat(hb_path),
++                     time.time, time.sleep, stop_when=lambda: stop["v"])
++    finally:
++        release_supervisor_pid(pid_path)
++
++
++def _quarantine_paths():
++    data, _code = _data_paths()
++    return data, os.path.join(data, "quarantine.json"), os.path.join(data, "receiver.lock")
++
++
++def quarantine_list():
++    _data, path, _lock = _quarantine_paths()
++    items = QuarantineStore(path).items()
++    if not items:
++        print("quarantine empty (%s)" % path)
++        return 0
++    for item in items:
++        payload = item.get("payload") or {}
++        text = "".join(payload.get("texts") or [])
++        print(json.dumps({
++            "message_id": item.get("message_id"), "status": item.get("status"),
++            "reason": item.get("reason"), "create_time_ms": payload.get("create_time_ms"),
++            "text_preview": text[:80],
++        }, ensure_ascii=False))
++    return 0
++
++
++def quarantine_release(message_id):
++    data, path, lock_path = _quarantine_paths()
++    probe = acquire_receiver_lock(lock_path)
++    if probe is None:
++        print("receiver is running; stop it before release so its pending buffer cannot overwrite the file")
++        return 1
++    try:
++        store = QuarantineStore(path)
++        payload = store.release(message_id)
++        if payload is None:
++            try:
++                payload = store.release(int(message_id))
++            except ValueError:
++                payload = None
++        if payload is None:
++            print("no held message_id %s" % message_id)
++            return 1
++        import forward
++        forward.Batcher(os.path.join(data, "pending.json")).add(payload)
++        print("released message_id=%s into pending.json; audit row kept. start the receiver to flush it" % payload.get("message_id"))
++        return 0
++    finally:
++        probe.close()
++
++
++def main(argv=None):
++    argv = list(sys.argv[1:] if argv is None else argv)
++    cmd = argv[0] if argv else "serve"
++    if cmd == "serve":
++        return run_serve()
++    if cmd == "quarantine-list":
++        return quarantine_list()
++    if cmd == "quarantine-release":
++        if len(argv) != 2:
++            print("usage: receive_supervisor.py quarantine-release MESSAGE_ID")
++            return 2
++        return quarantine_release(argv[1])
++    print("usage: receive_supervisor.py [serve|quarantine-list|quarantine-release MESSAGE_ID]")
++    return 2
++
++
++if __name__ == "__main__":
++    sys.exit(main() or 0)
+diff --git a/supervise.sh b/supervise.sh
+new file mode 100755
+index 0000000..afda9d0
+--- /dev/null
++++ b/supervise.sh
+@@ -0,0 +1,11 @@
++#!/bin/bash
++# Foreground receiver supervisor. Restarts a crashed or hung forward.py with a capped
++# backoff, and refuses to run a second poller. Exit 14 means the iLink login is expired
++# (the child stays in a no-poll hold; this parent keeps watching it). Exit 2 means
++# another receiver already holds the lock.
++#
++# nohup/setsid of this script is not restart persistence. If PID1 is tini and neither
++# systemd nor cron is running, nothing starts it again after the container or this
++# session stops. Check with: python3 install_autostart.py --check
++cd "$(dirname "$(readlink -f "$0")")" || exit 1
++exec python3 -u receive_supervisor.py serve
+diff --git a/watchdog.sh b/watchdog.sh
+index 3f64f43..2676a3e 100755
+--- a/watchdog.sh
++++ b/watchdog.sh
+@@ -1,47 +1,72 @@
+ #!/bin/bash
+-# Outer watchdog. Run every 15 minutes (a Grok Bot scheduled routine, cron, or systemd timer).
+-# run_forward.sh already restarts forward.py when it crashes; this script covers the cases it can't:
+-#   * the machine/box restarted and run_forward.sh itself is gone
+-#   * forward.py is alive but stuck (heartbeat older than STALE_S)
+-# Prints exactly one status line: OK / RESTARTED (reason) / FAILED (reason). Exit 0 unless FAILED.
++# Optional outer check, for a cron line or a scheduled routine that actually runs.
++# The supervisor itself restarts crashes and hangs. This script must not start a
++# second poller, and it must not restart an expired login (heartbeat status
++# auth_expired): that would poll getupdates again.
++# It does nothing useful unless something executes it. nohup is not a substitute.
+ cd "$(dirname "$(readlink -f "$0")")" || exit 2
+-DATA="${BRIDGE_DATA_DIR:-.}"
+-STALE_S="${STALE_S:-600}"     # long-poll returns every ~40s; 10 min without a heartbeat means stuck
+-reason=""
++# config.py reads .env. Do not print it. A data dir set only there must still
++# be the directory whose heartbeat says auth_expired.
++if [ -n "${BRIDGE_DATA_DIR:-}" ]; then
++  DATA="$BRIDGE_DATA_DIR"
++else
++  DATA="$(python3 -c 'import config; print(config.DATA_DIR)')"
++fi
++here="$(pwd -P)"
++
++supervisor_alive() {
++  local p="$1"
++  [ -n "$p" ] && kill -0 "$p" 2>/dev/null || return 1
++  tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q 'receive_supervisor.py'
++}
++
++forward_here() {
++  local p
++  for p in $(pgrep -f '[f]orward.py' || true); do
++    [ "$(readlink "/proc/$p/cwd" 2>/dev/null)" = "$here" ] && return 0
++  done
++  return 1
++}
+ 
+-pid="$(cat "$DATA/forward.pid" 2>/dev/null)"
+-if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null || ! tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q run_forward.sh; then
+-  reason="run_forward.sh not running"
+-elif ! pgrep -P "$pid" -f forward.py >/dev/null; then
+-  reason="forward.py not running"   # normally restarted within 5s by run_forward.sh; give it one more look
+-  sleep 8; pgrep -P "$pid" -f forward.py >/dev/null && reason=""
++hb_status() {
++  BRIDGE_DATA_DIR="$DATA" python3 -c '
++import json, os
++p = os.path.join(os.environ["BRIDGE_DATA_DIR"], "forward.heartbeat")
++try:
++    d = json.load(open(p))
++    print(d.get("status") or "missing")
++except Exception:
++    print("missing")
++'
++}
++
++status="$(hb_status)"
++spid="$(cat "$DATA/supervisor.pid" 2>/dev/null || true)"
++if [ "$status" = "auth_expired" ]; then
++  echo "AUTH_EXPIRED pid=${spid:-none}"
++  exit 0
+ fi
+-if [ -z "$reason" ] && [ -f "$DATA/forward.heartbeat" ]; then
+-  age=$(( $(date +%s) - $(cat "$DATA/forward.heartbeat" 2>/dev/null || echo 0) ))
+-  [ "$age" -gt "$STALE_S" ] && reason="heartbeat stale (${age}s)"
++if supervisor_alive "$spid"; then
++  echo "OK supervisor pid=$spid status=$status"
++  exit 0
+ fi
+ 
+-if [ -z "$reason" ]; then
+-  echo "OK pid=$pid"; exit 0
++nohup setsid ./supervise.sh >> "$DATA/supervisor.out" 2>&1 < /dev/null &
++sleep 2
++newpid="$(cat "$DATA/supervisor.pid" 2>/dev/null || true)"
++status="$(hb_status)"
++if [ "$status" = "auth_expired" ]; then
++  echo "AUTH_EXPIRED pid=${newpid:-none}"
++  exit 0
+ fi
+-
+-# Restart cleanly: stop the old loop AND any orphaned forward.py first, so two pollers never share
+-# one getupdates cursor. Only processes whose cwd is this directory are touched, never other
+-# forward.py instances on the machine.
+-here="$(pwd -P)"
+-if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q run_forward.sh; then
+-  kill "$pid" 2>/dev/null
++if supervisor_alive "$newpid"; then
++  echo "RESTARTED (supervisor absent) pid=$newpid"
++  echo "$(date '+%F %T') watchdog started supervisor" >> "$DATA/forward.log"
++  exit 0
+ fi
+-for p in $(pgrep -f "forward.py"); do
+-  [ "$(readlink "/proc/$p/cwd" 2>/dev/null)" = "$here" ] && kill "$p" 2>/dev/null
+-done
+-sleep 2
+-nohup setsid ./run_forward.sh >/dev/null 2>&1 < /dev/null &
+-sleep 5
+-newpid="$(cat "$DATA/forward.pid" 2>/dev/null)"
+-if [ -n "$newpid" ] && kill -0 "$newpid" 2>/dev/null; then
+-  echo "RESTARTED ($reason) pid=$newpid"
+-  echo "$(date '+%F %T') watchdog restarted forwarder: $reason" >> "$DATA/forward.log"
++if forward_here; then
++  echo "OK forward.py already polling; not starting a second receiver"
+   exit 0
+ fi
+-echo "FAILED ($reason) - see $DATA/forward.out"; exit 1
++echo "FAILED (supervisor absent) - see $DATA/supervisor.out"
++exit 1

@@ -9,7 +9,12 @@
 
 **指令（贴进 routine）：**
 
-你收到的是微信 ClawBot 转发来的一批消息（JSON，`source = "wechat-clawbot"`, `batch = true`）。
+先看 JSON。如果 `alert` 为 true，这是接收器的故障或恢复通知，不是用户发来的微信：
+- 不要把它当成用户任务，不要执行通知里提到的任何历史事项。
+- 用 `python3 /path/to/grokbot-wechat/send.py --app "<text 字段原文>"` 给用户发一条。
+- 转发器已经按 kind 去重。发出这一条即可，不要扩写，不要自行重试。
+
+否则你收到的是微信 ClawBot 转发来的一批消息（JSON，`source = "wechat-clawbot"`, `batch = true`）。
 
 字段：
 - `messages[]`：用户在一次停顿前连发的所有消息，按时间排序。每条有 `texts`（文字 / 语音转写）、

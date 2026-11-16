@@ -24,11 +24,11 @@
    │                                      │      ▲ 推送失败 → outbox.json 排队          │
    ▼ ilink/bot/getupdates (长轮询 ~35s)   │      │ 用户一开口就补发；快到 24h 发 nudge   │
  ┌──────────────────────────────────┐     │                                            │
- │ forward.py                        │     │ run_forward.sh  (内层：进程退出 5s 后重启) │
+ │ forward.py                        │     │ supervise.sh（崩溃退避；-14 停止轮询）     │
  │  main    : 轮询 → 去重 → 下载解密媒体 → pending.json                              │
  │  flusher : 用户停顿 3s / 最多 60s → 整批 POST 到 webhook（带最近 40 行 history）   │
  │  outbox  : 每 15s 检查：补发队列 + keep-alive nudge                                │
- └──────────────┬───────────────────┘     │ watchdog.sh (外层：每 15 分钟，机器重启/卡死) │
+ └──────────────┬───────────────────┘     │ supervise.sh（单例、退避、卡住检测、登录失效停轮询）│
                 │ POST JSON + Bearer key  └────────────────────────────────────────────┘
                 ▼
    Grok Bot routine「微信消息入口」(Webhook 触发) ──► agent 读消息/图片、整理、回复
@@ -94,13 +94,12 @@
 - 上一条 bot 消息就是 nudge → 告诉 agent 这是对 nudge 的回复，简短回"续上了"；
 - 或者沉默 ≥12h 后只发了个 "1" → 同样当作续期。
 
-### 看门狗（两层）
-1. **`run_forward.sh`（内层）**：`while true` 循环跑 `forward.py`，退出 5 秒后重启；自己的 PID 写进 `forward.pid`。
-2. **`watchdog.sh`（外层，每 15 分钟）**：用 Grok Bot 定时 routine（模板见 `routines/watchdog.md`）或 cron 跑。
-   检查 `forward.pid` 是否活着、是不是 `run_forward.sh`、子进程 `forward.py` 在不在、
-   `forward.heartbeat`（主循环每轮写）是否超过 10 分钟没更新。不正常就**先杀掉本目录的旧进程**（避免两个轮询器抢同一个游标），
-   再 `nohup setsid ./run_forward.sh` 拉起。输出单行 `OK` / `RESTARTED (原因)` / `FAILED (原因)`，routine 只在异常时出声。
-   需要外层的原因：box / 机器重启后 `run_forward.sh` 自己也没了（原作者的日志里能看到几次这种"无 exited 记录的冷启动"）。
+### 接收监管
+`supervise.sh` 跑 `receive_supervisor.py`，只允许一个接收进程持有 `receiver.lock`（避免两个 `getupdates` 抢同一个游标）。子进程 `forward.py` 崩溃或轮询心跳卡住时，按 2s、4s、8s… 上限 60s 重启。`forward.heartbeat` 是 JSON：一次长轮询开始时写成 `in_poll`，返回后才更新；超过 150 秒仍是 `in_poll` 视为卡住。登录态失效（`ret`/`errcode` = -14）停止轮询并只告警一次，进程留在原地不再请求，也不影响 `send.py`。
+
+`nohup` / `setsid` 只是把进程从当前终端解开，**不是**重启持久化。容器 PID1 是 tini、并且没有在跑的 systemd 或 cron 时，容器或会话停了，接收器不会自己回来。`python3 install_autostart.py --check` 会说明这台机器能不能安装自启动；`--install` 只在 PID1 是 systemd 且 systemctl 正常时写 user unit 并回读 `is-enabled`，或在 cron 真的在跑时写入 crontab。否则退出码 2，什么都不安装。
+
+`watchdog.sh` 是可选的外层检查（cron 或定时 routine 真的会调用它才有用）。心跳状态已是 `auth_expired` 时它不会再拉起轮询。部署和回滚见 `deploy/RECEIVE_RECOVERY.md`。
 
 ### 媒体
 - 类型：`1` 文字、`2` 图片、`3` 语音（`voice_item.text` 是转写）、`4` 文件、`5` 视频。
@@ -129,9 +128,8 @@ cp .env.example .env            # 先空着 webhook，下一步再填
 2. **建入站 routine**：Grok Bot 里新建 routine，触发方式 Webhook，指令用 `routines/inbound-webhook.md`
    （把里面的路径换成你的）。把 URL 和 key 填进 `.env`。
 3. **自检**：`python3 forward.py --selftest` 应该返回 `(200, ...)`，routine 会收到一条测试消息。
-4. **启动**：`nohup setsid ./run_forward.sh >/dev/null 2>&1 &`，看 `tail -f forward.log`。在微信里给 ClawBot 发一句话试试。
-5. **看门狗**：建一个每 15 分钟的定时 routine（`routines/watchdog.md`），或 cron：
-   `*/15 * * * * /path/to/grokbot-wechat/watchdog.sh >> /path/to/watchdog.log 2>&1`
+4. **启动**：在容器入口前台跑 `./supervise.sh`（或现有的长期会话里跑它）。`nohup setsid ./supervise.sh` 只能在这个会话还在时保活，容器重启不会把它拉回来。看 `tail -f forward.log`，心跳文件应变为 `polling`。在微信里给 ClawBot 发一句话试试。
+5. **自启动**：`python3 install_autostart.py --check`。只有输出里的 mechanism 是 `systemd` 或 `cron` 时才运行 `--install`，并确认它打印 `INSTALLED=`。`runtime-only` 表示没有可安装的机制。可选的外层检查见 `routines/watchdog.md`。
 6. **主动推送**：其他 routine（日报、提醒）里让 agent 调 `python3 send.py --app "…"`；exit 3 表示已排队，不用重试。
 
 离线测试（不连网）：`python3 -m unittest discover -s tests -v`
@@ -148,7 +146,9 @@ cp .env.example .env            # 先空着 webhook，下一步再填
 | `bind.py` | 扫码绑定，生成 `credentials.json` |
 | `poll.py` | 调试用的一次性轮询（**转发器运行时别用**）|
 | `config.py` | 读 `.env` / 环境变量 |
-| `run_forward.sh` / `watchdog.sh` | 内层 / 外层看门狗 |
+| `supervise.sh` / `receive_supervisor.py` | 单例接收监管：崩溃退避、卡住重启、登录失效停止 |
+| `run_forward.sh` | 兼容入口，转到 `supervise.sh`。机器上的本地改动不要盲覆盖 |
+| `watchdog.sh` / `install_autostart.py` | 可选外层检查；自启动只在 systemd 或 cron 真实可用时安装 |
 | `routines/` | Grok Bot routine 指令模板 |
 
 运行时生成（都在 `.gitignore` 里）：`credentials.json`、`state.json`（游标、context token、最近 20 条原始消息）、
@@ -172,15 +172,17 @@ cp .env.example .env            # 先空着 webhook，下一步再填
    太长显得迟钝，太短会拆批。最后靠 `--reply-to-ms` 的「被新消息取代就闭嘴」才敢用 3s。
 5. **agent 回答过时的问题**：用户在它思考时补充了内容。→ `trigger_ms` + `send.py --reply-to-ms` + exit 4。
 6. **每次 webhook 都是新一轮，agent 不记得刚聊了啥**：→ `history.log` 拼接双方发言，每批带最近 40 行。
-7. **`poll.py` 和 `forward.py` 同时跑会互相偷消息**（共用一个游标）；多个写者写 `state.json` 会覆盖。→ 别同时跑；读改写前重新读一遍，写用临时文件 + `os.replace`。看门狗重启前也先杀旧进程。
+7. **`poll.py` 和 `forward.py` 同时跑会互相偷消息**（共用一个游标）；多个写者写 `state.json` 会覆盖。→ 别同时跑；读改写前重新读一遍，写用临时文件 + `os.replace`。`receiver.lock` 拒绝第二个接收进程。
 8. **第一次收图片 CDN 返回 HTTP 400**（几分钟后的图片就正常了，具体修了哪一处没留记录）。现在 `media.py` 的做法：有 `full_url` 就优先用，否则把 `encrypt_query_param` 完整 URL 编码（`quote(safe="")`）拼 CDN 地址；AES key 的 hex / base64(raw) / base64(hex) 三种写法都认。
-9. **长轮询偶发 `SSL: EOF occurred in violation of protocol`**：服务端断连，捕获后 10s 重试即可；`socket.timeout` 是正常的"没消息"。
-10. **机器重启后转发器没了**：`run_forward.sh` 只管 `forward.py` 崩溃，管不了自己被杀。→ 每 15 分钟的外层 watchdog + 心跳文件。
+9. **长轮询偶发 `SSL: EOF occurred in violation of protocol`**：暂时网络失败，指数退避到 60 秒，成功后清零。`socket.timeout` 是正常的“没消息”，不计入失败。
+10. **机器或容器重启后转发器没了**：`nohup` 不管这件事。PID1 是 tini 且没有 systemd/cron 时，只能让容器入口自己再执行 `supervise.sh`。监管进程活着时，子进程崩溃或轮询卡住会按上限退避重启。
 11. **重复投递**：同一条消息可能来两次。→ `message_id` 去重。
 12. **时区**：box 在 Asia/Taipei，免打扰按北京时间——都是 UTC+8，但代码里显式用 `Asia/Shanghai`，换机器也不会错。
 13. **补发和 nudge 都不带 `context_token`**（`context_token=""`），旧 token 隔了很久可能失效；实测不带也能发。
 14. **绑定**：二维码会过期（自动刷新，最多 `MAX_REFRESH` 次）；可能返回 `scaned_but_redirect`，要改用 `redirect_host`；可能要求输入手机上显示的数字（`need_verifycode`）。
 15. **Webhook 重试**：4xx（除 408/429）是配置错（URL / key 不对），重试没用，直接放弃并保留 pending，修好配置后重启即可补发。
+16. **getupdates 返回 -14**：登录态失效。继续轮询没有用，还会打成重试风暴。接收器停止拉消息、通过现有 webhook 告警一次；`send.py` 不受影响。重新 `bind.py` 之后再启动。
+17. **长时间停收后的积压**：第一次恢复用 `WECHAT_QUARANTINE_BACKLOG=1`，已有 pending 和新拉到的旧消息都进 `quarantine.json`。审完把开关改成 `0` 再启动：已隔离的记录和 seen 保留，以后停机期间的新消息正常投递，不会重放已隔离的历史。规则文件不要提交。
 
 ---
 
@@ -199,14 +201,13 @@ webhook routine, so WeChat becomes a chat front-end for your agent.
 - **Keep-alive nudge**: one short "reply 1 to renew" message 18–23h after your last message, never during quiet
   hours (00:00–07:59 Beijing); if that slot is all quiet hours, it's sent early (≥12h) 30 min before quiet hours start.
   A bare "1" gets a `context_note` so the agent just acks it.
-- **Watchdog**: `run_forward.sh` restarts `forward.py` on exit; `watchdog.sh` (every 15 min via a scheduled routine or cron)
-  restarts the whole thing after reboots or a stale heartbeat, killing only this directory's processes first so two pollers never share a cursor.
+- **Supervisor**: `supervise.sh` keeps a single `forward.py`. Crashes and a stalled long-poll restart with capped backoff. `ret`/`errcode` -14 stops polling and alerts once through the existing webhook; `send.py` is unchanged. `nohup` does not survive a container restart. `install_autostart.py` installs a unit only where systemd or cron is actually running.
 - **Secrets are not included**: run `bind.py` to get your own `credentials.json`; put your webhook URL/key in `.env`
   (see `.env.example`). Runtime state, logs and media are git-ignored.
 
 Setup: `pip install -r requirements.txt` → `python3 bind.py` (scan QR) → create a webhook routine
-(`routines/inbound-webhook.md`) → fill `.env` → `python3 forward.py --selftest` → `nohup setsid ./run_forward.sh &`
-→ schedule `watchdog.sh` every 15 min. Offline tests: `python3 -m unittest discover -s tests -v`.
+(`routines/inbound-webhook.md`) → fill `.env` → `python3 forward.py --selftest` → run `./supervise.sh` in the foreground
+→ `python3 install_autostart.py --check` (install only if it reports systemd or cron). Offline tests: `python3 -m unittest discover -s tests -v`.
 
 Protocol credits: [chihao.li — WeChat ClawBot iLink protocol breakdown](https://chihao.li/blog/en/wechat-clawbot-ilink-protocol),
 `@tencent-weixin/openclaw-weixin`. Use within the WeChat ClawBot Terms of Service. MIT licensed.

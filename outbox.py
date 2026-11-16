@@ -8,7 +8,7 @@ import json, os, time, logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from config import QUIET_TZ, NUDGE_TEXT, quiet_hours
-from ilink import DIR, load_state, save_state, send_text
+from ilink import DIR, load_state, mutate_state, save_state, send_text
 BJ = ZoneInfo(QUIET_TZ)
 
 OUTBOX = os.path.join(DIR, "outbox.json")   # queued texts; may contain private content, NEVER commit
@@ -85,6 +85,6 @@ def maybe_nudge(now=None):
     if age < NUDGE_AFTER_S and now < latest_ok_s(last) - NUDGE_MARGIN_S: return False
     try: resp, _ = send_text(NUDGE_TEXT, context_token="")
     except Exception as e: resp = "%s: %s" % (type(e).__name__, e)
-    st = load_state(); st["nudged_for"] = last; save_state(st)  # one attempt per window
+    mutate_state(lambda st, _last=last: st.__setitem__("nudged_for", _last))  # one attempt per window
     log.info("keepalive nudge sent=%s age=%.1fh", is_ok(resp), age / 3600)
     return is_ok(resp)
