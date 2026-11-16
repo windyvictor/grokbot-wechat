@@ -1,5 +1,5 @@
 diff --git a/forward.py b/forward.py
-index 5117149..d6a2968 100755
+index 5117149..9e10ad8 100755
 --- a/forward.py
 +++ b/forward.py
 @@ -1,18 +1,23 @@
@@ -196,7 +196,7 @@ index 5117149..d6a2968 100755
  
  def outbox_loop():
      """Flush queued sends right after the user writes; nudge near window end."""
-@@ -224,27 +304,63 @@ def outbox_loop():
+@@ -224,27 +304,78 @@ def outbox_loop():
              log.warning("outbox loop error: %s: %s", type(e).__name__, e)
          time.sleep(15)
  
@@ -217,6 +217,22 @@ index 5117149..d6a2968 100755
 +            current["raw_log"] = snapshot["raw_log"]
 +    ilink.mutate_state(merge)
 +
++def quarantine_backlog_enabled(value=None):
++    """True only for the one-time recovery switch.
++
++    Unset, empty, and 0 leave held quarantine rows and seen ids in place and
++    deliver later downtime messages through pending as usual.
++    """
++    if value is None:
++        value = os.environ.get("WECHAT_QUARANTINE_BACKLOG", "")
++    return str(value).strip().lower() in ("1", "true", "yes")
++
++def prepare_recovery_buffers(pending_path, store, enabled):
++    """Sweep pending into quarantine only while the one-time switch is on."""
++    if not enabled:
++        return []
++    return guard.sweep_preexisting_pending(pending_path, store)
++
 +def _deliver_alert(payload):
 +    result = post_webhook(payload, tries=1)
 +    if not (isinstance(result, tuple) and 200 <= int(result[0]) < 300):
@@ -231,15 +247,14 @@ index 5117149..d6a2968 100755
 +        log.error("another receiver holds the lock; not polling")
 +        sys.exit(guard.LOCK_EXIT)
 +    globals()["_receiver_lock"] = lock  # keep the inherited or acquired fd open
-+    backlog = os.environ.get("WECHAT_QUARANTINE_BACKLOG", "").strip().lower() in ("1", "true", "yes")
++    backlog = quarantine_backlog_enabled()
 +    backlog_before = int(time.time() * 1000) if backlog else None
 +    log.info("forwarder start pid=%d url_set=%s key_present=%s quiet=%ds cap=%ds backlog_before=%s",
 +             os.getpid(), bool(WEBHOOK_URL), bool(webhook_key()), QUIET_S, CAP_S, backlog_before)
 +    store = guard.QuarantineStore(os.path.join(DIR, "quarantine.json"))
-+    if backlog:
-+        moved = guard.sweep_preexisting_pending(PENDING, store)
-+        if moved:
-+            log.info("quarantined %d preexisting pending message(s)", len(moved))
++    moved = prepare_recovery_buffers(PENDING, store, backlog)
++    if moved:
++        log.info("quarantined %d preexisting pending message(s)", len(moved))
      batcher = Batcher()
 +    alerter = guard.AlertDeduper(os.path.join(DIR, "alert_state.json"), _deliver_alert)
      threading.Thread(target=batcher.run, daemon=True, name="flusher").start()
@@ -436,10 +451,10 @@ index 81c9e1a..c5ebd46 100644
      return is_ok(resp)
 diff --git a/receive_supervisor.py b/receive_supervisor.py
 new file mode 100644
-index 0000000..69aeecd
+index 0000000..fdc5b3b
 --- /dev/null
 +++ b/receive_supervisor.py
-@@ -0,0 +1,733 @@
+@@ -0,0 +1,766 @@
 +#!/usr/bin/env python3
 +"""Singleton supervisor for the WeChat receiver.
 +
@@ -1065,7 +1080,37 @@ index 0000000..69aeecd
 +    tmp = path + ".tmp"
 +    with open(tmp, "w", encoding="utf-8") as f:
 +        f.write(text)
++        f.flush()
++        os.fsync(f.fileno())
 +    os.replace(tmp, path)
++
++
++def publish_supervisor_pid(lock, path):
++    """Record our pid only after the receiver lock is held.
++
++    A contender that did not get the lock must not create, replace, or remove
++    the owner's supervisor.pid.
++    """
++    if lock is None:
++        return False
++    _write_text(path, str(os.getpid()) + "\n")
++    return True
++
++
++def release_supervisor_pid(path):
++    """Remove supervisor.pid only when it still names this process."""
++    try:
++        with open(path, encoding="utf-8") as f:
++            current = f.read().strip()
++    except OSError:
++        return False
++    if current != str(os.getpid()):
++        return False
++    try:
++        os.remove(path)
++    except OSError:
++        return False
++    return True
 +
 +
 +def run_serve():
@@ -1074,7 +1119,7 @@ index 0000000..69aeecd
 +    hb_path = os.path.join(data, "forward.heartbeat")
 +    alert_path = os.path.join(data, "alert_state.json")
 +    lock_path = os.path.join(data, "receiver.lock")
-+    _write_text(os.path.join(data, "supervisor.pid"), str(os.getpid()) + "\n")
++    pid_path = os.path.join(data, "supervisor.pid")
 +    stop = {"v": False}
 +
 +    def on_stop(signum, _frame):
@@ -1098,14 +1143,17 @@ index 0000000..69aeecd
 +
 +    lock = prepare_lock(lock_path, lambda: read_heartbeat(hb_path), time.time(), HANG_S, kill, time.sleep,
 +                        code_dir=code)
-+    if lock is None:
++    if not publish_supervisor_pid(lock, pid_path):
 +        log.error("another receiver holds the lock and its heartbeat is not a hang; not starting")
 +        return LOCK_EXIT
 +    log.info("supervisor start pid=%s", os.getpid())
-+    # serve() also locks when given lock_path. We already hold it, so pass None and keep `lock` alive.
-+    return serve(lambda _held: spawn_forward(lock, code), RestartPolicy(),
-+                 AlertDeduper(alert_path, poster), lambda: read_heartbeat(hb_path),
-+                 time.time, time.sleep, stop_when=lambda: stop["v"])
++    try:
++        # serve() also locks when given lock_path. We already hold it, so pass None and keep `lock` alive.
++        return serve(lambda _held: spawn_forward(lock, code), RestartPolicy(),
++                     AlertDeduper(alert_path, poster), lambda: read_heartbeat(hb_path),
++                     time.time, time.sleep, stop_when=lambda: stop["v"])
++    finally:
++        release_supervisor_pid(pid_path)
 +
 +
 +def _quarantine_paths():

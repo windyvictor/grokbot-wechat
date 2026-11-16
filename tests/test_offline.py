@@ -29,15 +29,22 @@ class BatcherTest(unittest.TestCase):
         return {"items": [{"type": 1, "text": text}], "texts": [text], "create_time_ms": ms, "message_id": ms}
 
     def test_quiet_flush_batches_burst(self):
-        b = self.mk()
-        b.add(self.msg("a", 1)); self.clock.t += 1; b.add(self.msg("b", 2))
-        self.assertFalse(b.maybe_flush())
-        self.clock.t += 3
-        self.assertTrue(b.maybe_flush())
-        self.assertEqual(self.sent[0]["count"], 2)
-        self.assertEqual(self.sent[0]["trigger_ms"], 2)
-        self.assertIn("--reply-to-ms 2", self.sent[0]["reply_rule"])
-        self.assertIn("Tester：a b", open(self.hist).read())
+        # history.OWNER_NAME is bound from the environment at import (default User).
+        # Pin it for this assertion only; do not change config.OWNER_NAME.
+        orig = history.OWNER_NAME
+        history.OWNER_NAME = "Tester"
+        try:
+            b = self.mk()
+            b.add(self.msg("a", 1)); self.clock.t += 1; b.add(self.msg("b", 2))
+            self.assertFalse(b.maybe_flush())
+            self.clock.t += 3
+            self.assertTrue(b.maybe_flush())
+            self.assertEqual(self.sent[0]["count"], 2)
+            self.assertEqual(self.sent[0]["trigger_ms"], 2)
+            self.assertIn("--reply-to-ms 2", self.sent[0]["reply_rule"])
+            self.assertIn("Tester：a b", open(self.hist).read())
+        finally:
+            history.OWNER_NAME = orig
 
     def test_failed_flush_is_kept_and_survives_restart(self):
         b = forward.Batcher(self.path, quiet=3, cap=60, poster=lambda body: None, clock=self.clock, history_path=self.hist)

@@ -623,7 +623,37 @@ def _write_text(path, text):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def publish_supervisor_pid(lock, path):
+    """Record our pid only after the receiver lock is held.
+
+    A contender that did not get the lock must not create, replace, or remove
+    the owner's supervisor.pid.
+    """
+    if lock is None:
+        return False
+    _write_text(path, str(os.getpid()) + "\n")
+    return True
+
+
+def release_supervisor_pid(path):
+    """Remove supervisor.pid only when it still names this process."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            current = f.read().strip()
+    except OSError:
+        return False
+    if current != str(os.getpid()):
+        return False
+    try:
+        os.remove(path)
+    except OSError:
+        return False
+    return True
 
 
 def run_serve():
@@ -632,7 +662,7 @@ def run_serve():
     hb_path = os.path.join(data, "forward.heartbeat")
     alert_path = os.path.join(data, "alert_state.json")
     lock_path = os.path.join(data, "receiver.lock")
-    _write_text(os.path.join(data, "supervisor.pid"), str(os.getpid()) + "\n")
+    pid_path = os.path.join(data, "supervisor.pid")
     stop = {"v": False}
 
     def on_stop(signum, _frame):
@@ -656,14 +686,17 @@ def run_serve():
 
     lock = prepare_lock(lock_path, lambda: read_heartbeat(hb_path), time.time(), HANG_S, kill, time.sleep,
                         code_dir=code)
-    if lock is None:
+    if not publish_supervisor_pid(lock, pid_path):
         log.error("another receiver holds the lock and its heartbeat is not a hang; not starting")
         return LOCK_EXIT
     log.info("supervisor start pid=%s", os.getpid())
-    # serve() also locks when given lock_path. We already hold it, so pass None and keep `lock` alive.
-    return serve(lambda _held: spawn_forward(lock, code), RestartPolicy(),
-                 AlertDeduper(alert_path, poster), lambda: read_heartbeat(hb_path),
-                 time.time, time.sleep, stop_when=lambda: stop["v"])
+    try:
+        # serve() also locks when given lock_path. We already hold it, so pass None and keep `lock` alive.
+        return serve(lambda _held: spawn_forward(lock, code), RestartPolicy(),
+                     AlertDeduper(alert_path, poster), lambda: read_heartbeat(hb_path),
+                     time.time, time.sleep, stop_when=lambda: stop["v"])
+    finally:
+        release_supervisor_pid(pid_path)
 
 
 def _quarantine_paths():

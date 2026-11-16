@@ -139,7 +139,9 @@ WECHAT_QUARANTINE_BACKLOG= ./supervise.sh
 
 释放只把那一条放进 `pending.json`。隔离文件里的记录改成 `released`，payload 还在。未释放的继续 `held`。不要用“全部释放”。
 
-游标在这一轮会前进。之后即使关掉 backlog 开关，已经进过 seen 的消息也不会再被拉进 webhook。所以开关必须在第一次启动前就打开。
+游标在这一轮会前进。审完隔离区之后，把生产 `.env` 里的 `WECHAT_QUARANTINE_BACKLOG` 改成 `0`（或删掉这一行）再启动。隔离记录和 `forward_seen.json` 都留着，已隔离的消息不会重放。开关关掉以后，再停机期间新到的消息走正常的 pending，不会再整批进隔离区。不要为了这个去释放已经 held 的记录。
+
+开关必须在第一次启动前打开。第一次成功审完之前不要改成 0。
 
 ## 回滚
 

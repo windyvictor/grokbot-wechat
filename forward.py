@@ -321,6 +321,22 @@ def save_polled_state(snapshot):
             current["raw_log"] = snapshot["raw_log"]
     ilink.mutate_state(merge)
 
+def quarantine_backlog_enabled(value=None):
+    """True only for the one-time recovery switch.
+
+    Unset, empty, and 0 leave held quarantine rows and seen ids in place and
+    deliver later downtime messages through pending as usual.
+    """
+    if value is None:
+        value = os.environ.get("WECHAT_QUARANTINE_BACKLOG", "")
+    return str(value).strip().lower() in ("1", "true", "yes")
+
+def prepare_recovery_buffers(pending_path, store, enabled):
+    """Sweep pending into quarantine only while the one-time switch is on."""
+    if not enabled:
+        return []
+    return guard.sweep_preexisting_pending(pending_path, store)
+
 def _deliver_alert(payload):
     result = post_webhook(payload, tries=1)
     if not (isinstance(result, tuple) and 200 <= int(result[0]) < 300):
@@ -333,15 +349,14 @@ def main():
         log.error("another receiver holds the lock; not polling")
         sys.exit(guard.LOCK_EXIT)
     globals()["_receiver_lock"] = lock  # keep the inherited or acquired fd open
-    backlog = os.environ.get("WECHAT_QUARANTINE_BACKLOG", "").strip().lower() in ("1", "true", "yes")
+    backlog = quarantine_backlog_enabled()
     backlog_before = int(time.time() * 1000) if backlog else None
     log.info("forwarder start pid=%d url_set=%s key_present=%s quiet=%ds cap=%ds backlog_before=%s",
              os.getpid(), bool(WEBHOOK_URL), bool(webhook_key()), QUIET_S, CAP_S, backlog_before)
     store = guard.QuarantineStore(os.path.join(DIR, "quarantine.json"))
-    if backlog:
-        moved = guard.sweep_preexisting_pending(PENDING, store)
-        if moved:
-            log.info("quarantined %d preexisting pending message(s)", len(moved))
+    moved = prepare_recovery_buffers(PENDING, store, backlog)
+    if moved:
+        log.info("quarantined %d preexisting pending message(s)", len(moved))
     batcher = Batcher()
     alerter = guard.AlertDeduper(os.path.join(DIR, "alert_state.json"), _deliver_alert)
     threading.Thread(target=batcher.run, daemon=True, name="flusher").start()

@@ -374,6 +374,34 @@ class PendingAndQuarantineTest(unittest.TestCase):
         self.assertFalse(batcher.maybe_flush())
         self.assertEqual(sent, [])
 
+    def test_backlog_off_keeps_held_and_delivers_later_downtime(self):
+        self.assertFalse(forward.quarantine_backlog_enabled("0"))
+        self.assertFalse(forward.quarantine_backlog_enabled(""))
+        self.assertFalse(forward.quarantine_backlog_enabled("false"))
+        self.assertTrue(forward.quarantine_backlog_enabled("1"))
+        tmp = tempfile.mkdtemp(prefix="backlog-off-")
+        pending_path = os.path.join(tmp, "pending.json")
+        seen_path = os.path.join(tmp, "seen.json")
+        preexisting = {"message_id": 4, "texts": ["still queued"], "create_time_ms": 50}
+        json.dump({"messages": [preexisting]}, open(pending_path, "w"))
+        store = guard.QuarantineStore(os.path.join(tmp, "q.json"))
+        store.hold({"message_id": 9, "texts": ["already handled"], "create_time_ms": 1794808380000},
+                   {"reason": "preexisting-pending"})
+        guard.atomic_json(seen_path, [9])
+        self.assertEqual(forward.prepare_recovery_buffers(pending_path, store, enabled=False), [])
+        self.assertEqual(json.load(open(pending_path))["messages"], [preexisting])
+        self.assertEqual(store.items()[0]["status"], "held")
+        t = {"n": 1000.0}
+        batcher = forward.Batcher(pending_path, quiet=30, cap=60, poster=lambda body: (200, "ok"),
+                                   clock=lambda: t["n"], history_path=os.path.join(tmp, "h.log"))
+        downtime = msg(11, "arrived while down", 100)
+        forward.handle([msg(9, "already handled", 1794808380000), downtime], batcher, store,
+                       seen_path, rules=[], backlog_before_ms=None)
+        self.assertEqual([m["message_id"] for m in batcher.msgs], [4, 11])
+        self.assertEqual(store.items()[0]["status"], "held")
+        self.assertEqual(store.items()[0]["payload"]["texts"], ["already handled"])
+        self.assertEqual(json.load(open(seen_path)), [9, 11])
+
     def test_seen_is_durable_before_the_next_message(self):
         tmp = tempfile.mkdtemp(prefix="seen-order-")
         seen_path = os.path.join(tmp, "seen.json")
@@ -438,6 +466,29 @@ class PendingAndQuarantineTest(unittest.TestCase):
         self.assertIsNotNone(got)
         self.assertEqual(killed, [9])
         got.close()
+
+    def test_failed_contender_keeps_owner_supervisor_pid(self):
+        tmp = tempfile.mkdtemp(prefix="sup-pid-")
+        pid_path = os.path.join(tmp, "supervisor.pid")
+        lock_path = os.path.join(tmp, "receiver.lock")
+        with open(pid_path, "w", encoding="utf-8") as f:
+            f.write("322481\n")
+        held = guard.acquire_receiver_lock(lock_path)
+        self.assertFalse(guard.publish_supervisor_pid(None, pid_path))
+        self.assertFalse(guard.release_supervisor_pid(pid_path))
+        self.assertEqual(open(pid_path, encoding="utf-8").read(), "322481\n")
+        env = os.environ.copy()
+        env["BRIDGE_DATA_DIR"] = tmp
+        env.pop("WECHAT_WEBHOOK_URL", None)
+        env.pop("WECHAT_WEBHOOK_KEY", None)
+        proc = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "receive_supervisor.py"), "serve"],
+            cwd=ROOT, env=env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(proc.returncode, guard.LOCK_EXIT, proc.stderr)
+        self.assertEqual(open(pid_path, encoding="utf-8").read(), "322481\n")
+        held.close()
+        self.assertTrue(guard.publish_supervisor_pid(guard.acquire_receiver_lock(lock_path), pid_path))
+        self.assertEqual(open(pid_path, encoding="utf-8").read().strip(), str(os.getpid()))
 
     def test_cursor_is_saved_only_after_pending_is_durable(self):
         tmp = tempfile.mkdtemp(prefix="cur-")
